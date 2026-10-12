@@ -4,6 +4,8 @@ import { createElement } from 'react';
 import type { ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { FakeReactorClient } from '../internal/fake-reactor-client';
+import { resolveJwtSource } from '../internal/jwt-resolver';
+import type { JwtResolver } from '../jwt';
 import { RecordingError, downloadClipAsFile } from '../recording';
 import type * as RecordingModule from '../recording';
 import type { Clip } from '../types';
@@ -166,20 +168,49 @@ describe('useClipDownload', () => {
     expect(result.current.state).toEqual({ kind: 'idle' });
   });
 
-  it("passes an explicit getJwt's resolved token through to downloadClipAsFile", async () => {
+  it('hands an explicit getJwt to downloadClipAsFile as a resolver', async () => {
     vi.mocked(downloadClipAsFile).mockResolvedValue(new Blob());
+    const getJwt = vi.fn(() => 'explicit-jwt');
 
-    const { result } = renderHook(() => useClipDownload(CLIP, { getJwt: () => 'explicit-jwt' }));
+    const { result } = renderHook(() => useClipDownload(CLIP, { getJwt }));
 
     await act(async () => {
       await result.current.download();
     });
 
-    expect(downloadClipAsFile).toHaveBeenCalledWith(
-      CLIP,
-      'reactor-clip.mp4',
-      expect.objectContaining({ jwt: 'explicit-jwt' }),
+    // A resolver, not a string: the manifest poll calls it before every
+    // attempt with the clip's session, so a long wait still gets a current token.
+    const options = vi.mocked(downloadClipAsFile).mock.calls[0]![2]!;
+
+    await expect(resolveJwtSource(options.jwt!, { sessionId: CLIP.sessionId })).resolves.toBe('explicit-jwt');
+    expect(getJwt).toHaveBeenCalledWith({ sessionId: CLIP.sessionId });
+  });
+
+  it('reads a getJwt swapped in by a rerender during an active download', async () => {
+    let release!: (blob: Blob) => void;
+
+    vi.mocked(downloadClipAsFile).mockImplementation(() => new Promise((resolve) => (release = resolve)));
+
+    const { result, rerender } = renderHook(
+      (props: { getJwt: JwtResolver }) => useClipDownload(CLIP, { getJwt: props.getJwt }),
+      { initialProps: { getJwt: () => 'old' } },
     );
+    let pending!: Promise<Blob | undefined>;
+
+    act(() => {
+      pending = result.current.download();
+    });
+    await waitFor(() => expect(downloadClipAsFile).toHaveBeenCalledTimes(1));
+    const options = vi.mocked(downloadClipAsFile).mock.calls[0]![2]!;
+
+    rerender({ getJwt: () => 'new' });
+
+    await expect(resolveJwtSource(options.jwt!, { sessionId: CLIP.sessionId })).resolves.toBe('new');
+
+    release(new Blob());
+    await act(async () => {
+      await pending;
+    });
   });
 
   it("falls back to the ReactorProvider's jwt when getJwt is omitted", async () => {
@@ -191,11 +222,9 @@ describe('useClipDownload', () => {
       await result.current.download();
     });
 
-    expect(downloadClipAsFile).toHaveBeenCalledWith(
-      CLIP,
-      'reactor-clip.mp4',
-      expect.objectContaining({ jwt: 'provider-jwt' }),
-    );
+    const options = vi.mocked(downloadClipAsFile).mock.calls[0]![2]!;
+
+    await expect(resolveJwtSource(options.jwt!, { sessionId: CLIP.sessionId })).resolves.toBe('provider-jwt');
   });
 
   it('omits jwt entirely outside a provider with no explicit getJwt (local-dev mode)', async () => {
