@@ -7,6 +7,14 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `Reactor.TokenOptions(sessions: [...])` mints a token bound to sessions that
+  already exist. A client that adopts a session it did not create needs such a
+  token, because a scoped token reaches only the sessions it created or was
+  bound to. Without `models` and `maxSessions`, the token can act only on those
+  sessions and cannot create new ones.
+
 ## [1.4.0] - 2026-10-08
 
 ### Added
