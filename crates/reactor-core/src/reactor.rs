@@ -1470,7 +1470,10 @@ impl Reactor {
                 continue;
             }
             match self.client_stats(track_stats, Some(connection_stat)) {
-                Ok(()) => sent_connect_time |= time_to_connect_ms.is_some(),
+                Ok(()) => {
+                    reporter.commit();
+                    sent_connect_time |= time_to_connect_ms.is_some();
+                }
                 Err(e) => log::debug!("[reactor] client stats send skipped: {e}"),
             }
         }
@@ -2685,7 +2688,7 @@ mod tests {
 
         use crate::protocol::wire::v1::control::ControlClientMessage;
         use crate::protocol::wire::v1::platform::{
-            client_track_stat, TrackDirection, TrackKind, VideoCodec,
+            client_track_stat, FrameStage, TrackDirection, TrackKind, VideoCodec,
         };
 
         let peer = Arc::new(RecordingPeer::default());
@@ -2698,6 +2701,11 @@ mod tests {
             codec: Some(client_track_stat::Codec::VideoCodec(VideoCodec::Vp9 as i32)),
             paused: false,
             metrics: HashMap::from([("bitrate_bps".to_string(), 950_000.0)]),
+            frame_stages: vec![FrameStage {
+                name: "decode".to_string(),
+                total_ms: 120.0,
+                frames: 150,
+            }],
         };
         let connection_stat = ClientConnectionStat {
             timestamp: 1_700_000_000_000,

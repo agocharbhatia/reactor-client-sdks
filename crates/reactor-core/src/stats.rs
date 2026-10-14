@@ -40,11 +40,13 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
-use crate::peer::{CandidatePairState, CandidatePairStats, StreamKind, TransportStats};
+use crate::peer::{
+    CandidatePairState, CandidatePairStats, StreamKind, TimingFrame, TransportStats,
+};
 use crate::protocol::session::{TrackDirection, TrackKind};
 use crate::protocol::webrtc::TrackMappingEntry;
 use crate::protocol::wire::v1::platform::{
-    client_track_stat, AudioCodec, ClientConnectionStat, ClientTrackStat,
+    client_track_stat, AudioCodec, ClientConnectionStat, ClientTrackStat, FrameStage,
     TrackDirection as WireTrackDirection, TrackKind as WireTrackKind, VideoCodec,
 };
 
@@ -590,7 +592,11 @@ fn round_ms(ms: f64) -> f64 {
     (ms * 1_000.0).round() / 1_000.0
 }
 
+/// One stream's stage: sent or received, its ssrc, and the stage's name.
+type StageKey = (bool, u32, &'static str);
+
 /// The previous reading of one RTP stream's byte counter.
+#[derive(Clone, Copy)]
 struct ByteSample {
     bytes: u64,
     at_ms: f64,
@@ -614,11 +620,27 @@ struct ByteSample {
 /// [`StatsSampler`]'s baseline on purpose: `get_stats()` callers poll on their
 /// own schedule, and a shared baseline would make each bitrate cover whatever
 /// window the other caller left.
+///
+/// The baselines move only when a batch goes out: [`Self::track_stats`] holds
+/// the new ones back and [`Self::commit`] applies them once the batch is
+/// accepted. A batch that is not sent leaves the baselines where they were, so
+/// the next batch's window covers its interval too instead of losing it.
 #[derive(Default)]
 pub struct ClientStatsReporter {
     /// Keyed by direction too: one ssrc number can appear on a sent and a
     /// received stream.
     last_bytes: HashMap<(bool, u32), ByteSample>,
+    /// The engine's running total of each stage, per stream, as of the
+    /// previous batch: time in seconds, and the frames it covers.
+    last_stage_totals: HashMap<StageKey, (f64, u64)>,
+    /// The last timing frame reported per received stream, so one that the
+    /// engine repeats across batches counts once.
+    last_timing_frame: HashMap<u32, u32>,
+    /// The baselines the last [`Self::track_stats`] call moves to once
+    /// committed. `None` drops a baseline.
+    pending_bytes: Vec<((bool, u32), ByteSample)>,
+    pending_stage_totals: Vec<(StageKey, Option<(f64, u64)>)>,
+    pending_timing_frames: Vec<(u32, u32)>,
 }
 
 impl ClientStatsReporter {
@@ -644,6 +666,9 @@ impl ClientStatsReporter {
         paused: &HashSet<String>,
         now_ms: f64,
     ) -> Vec<ClientTrackStat> {
+        self.pending_bytes.clear();
+        self.pending_stage_totals.clear();
+        self.pending_timing_frames.clear();
         let mut seen: HashSet<(bool, &str)> = HashSet::new();
         let mut stats = Vec::new();
 
@@ -679,7 +704,21 @@ impl ClientStatsReporter {
                     Some(f64::from(s.pli_count) + f64::from(s.fir_count)),
                 );
             }
-            stats.push(track_stat(track, codec, paused, m, now_ms));
+            let mut stages = Vec::new();
+            if track.kind == TrackKind::Video {
+                stages.extend(self.timing_frame_stages(s.ssrc, s.timing_frame));
+                stages.extend(self.stage(
+                    (true, s.ssrc, "jitter_buffer"),
+                    s.jitter_buffer_delay_s,
+                    s.jitter_buffer_emitted_count,
+                ));
+                stages.extend(self.stage(
+                    (true, s.ssrc, "decode"),
+                    s.total_decode_time_s,
+                    u64::from(s.frames_decoded),
+                ));
+            }
+            stats.push(track_stat(track, codec, paused, m, stages, now_ms));
         }
 
         for s in &raw.outbound {
@@ -732,23 +771,101 @@ impl ClientStatsReporter {
                     Some(f64::from(s.pli_count) + f64::from(s.fir_count)),
                 );
             }
-            stats.push(track_stat(track, codec, paused, m, now_ms));
+            let mut stages = Vec::new();
+            if track.kind == TrackKind::Video {
+                stages.extend(self.stage(
+                    (false, s.ssrc, "encode"),
+                    s.total_encode_time_s,
+                    u64::from(s.frames_encoded),
+                ));
+            }
+            stats.push(track_stat(track, codec, paused, m, stages, now_ms));
         }
 
         stats
+    }
+
+    /// Move the baselines to the readings of the last [`Self::track_stats`]
+    /// call, once the batch it built has gone out.
+    pub fn commit(&mut self) {
+        for (key, sample) in self.pending_bytes.drain(..) {
+            self.last_bytes.insert(key, sample);
+        }
+        for (key, totals) in self.pending_stage_totals.drain(..) {
+            match totals {
+                Some(totals) => self.last_stage_totals.insert(key, totals),
+                None => self.last_stage_totals.remove(&key),
+            };
+        }
+        for (ssrc, rtp_timestamp) in self.pending_timing_frames.drain(..) {
+            self.last_timing_frame.insert(ssrc, rtp_timestamp);
+        }
+    }
+
+    /// The time the engine spent on *key*'s stage since the previous batch,
+    /// from its running total of *seconds* over *frames*, and the baseline for
+    /// the next one. `None` on a stream's first batch, when no frame went
+    /// through the stage, and when a total went backwards (a reset engine).
+    fn stage(&mut self, key: StageKey, seconds: f64, frames: u64) -> Option<FrameStage> {
+        // A total that is not a number is no baseline either: the next finite
+        // one starts a fresh window rather than differencing against it.
+        if !seconds.is_finite() {
+            self.pending_stage_totals.push((key, None));
+            return None;
+        }
+        self.pending_stage_totals
+            .push((key, Some((seconds, frames))));
+        let (seconds_before, frames_before) = *self.last_stage_totals.get(&key)?;
+        if frames <= frames_before || seconds < seconds_before {
+            return None;
+        }
+        Some(FrameStage {
+            name: key.2.to_string(),
+            total_ms: (seconds - seconds_before) * 1_000.0,
+            frames: frames - frames_before,
+        })
+    }
+
+    /// The sender's stages for a timing frame the stream has not reported
+    /// before, one frame each. The engine's timing frame is the slowest
+    /// sampled frame of the last second, so these stages are a sample that
+    /// leans slow, not a window's mean like `decode` or `jitter_buffer`: the
+    /// wire documents their average as an upper bound.
+    fn timing_frame_stages(&mut self, ssrc: u32, timing: Option<TimingFrame>) -> Vec<FrameStage> {
+        let Some(t) = timing else {
+            return Vec::new();
+        };
+        self.pending_timing_frames.push((ssrc, t.rtp_timestamp));
+        if self.last_timing_frame.get(&ssrc) == Some(&t.rtp_timestamp) {
+            return Vec::new();
+        }
+        [
+            ("encode_wait", t.encode_wait_ms),
+            ("packetize", t.packetize_ms),
+            ("pacer", t.pacer_ms),
+        ]
+        .into_iter()
+        .filter(|(_, ms)| ms.is_finite() && *ms >= 0.0)
+        .map(|(name, total_ms)| FrameStage {
+            name: name.to_string(),
+            total_ms,
+            frames: 1,
+        })
+        .collect()
     }
 
     /// The stream's bitrate since the previous batch, in bits per second, and
     /// the baseline for the next one. `None` on a stream's first batch, and
     /// when the counter went backwards (a reset engine) or no time passed.
     fn bitrate(&mut self, key: (bool, u32), bytes: u64, now_ms: f64) -> Option<f64> {
-        let previous = self.last_bytes.insert(
+        self.pending_bytes.push((
             key,
             ByteSample {
                 bytes,
                 at_ms: now_ms,
             },
-        )?;
+        ));
+        let previous = *self.last_bytes.get(&key)?;
         if now_ms <= previous.at_ms || bytes < previous.bytes {
             return None;
         }
@@ -779,6 +896,7 @@ fn track_stat(
     codec: client_track_stat::Codec,
     paused: &HashSet<String>,
     metrics: Metrics,
+    frame_stages: Vec<FrameStage>,
     now_ms: f64,
 ) -> ClientTrackStat {
     let kind = match track.kind {
@@ -797,6 +915,7 @@ fn track_stat(
         codec: Some(codec),
         paused: paused.contains(&track.name),
         metrics: metrics.0,
+        frame_stages,
     }
 }
 
@@ -1825,12 +1944,18 @@ mod tests {
             ..TransportStats::default()
         };
 
-        let first = reporter.track_stats(&at(10_000), &tracks(), &HashSet::new(), 0.0);
+        let first = send_batch(&mut reporter, &at(10_000), &tracks(), &HashSet::new(), 0.0);
         assert!(first.iter().all(|s| !s.metrics.contains_key("bitrate_bps")));
 
         // 50 000 bytes over 5 s is 80 kbps; the sent stream, keyed apart from
         // the received one despite the same ssrc, did twice that.
-        let second = reporter.track_stats(&at(60_000), &tracks(), &HashSet::new(), 5_000.0);
+        let second = send_batch(
+            &mut reporter,
+            &at(60_000),
+            &tracks(),
+            &HashSet::new(),
+            5_000.0,
+        );
         assert_eq!(
             by_name(&second, "main_video").metrics["bitrate_bps"],
             80_000.0
@@ -1838,10 +1963,325 @@ mod tests {
         assert_eq!(by_name(&second, "webcam").metrics["bitrate_bps"], 160_000.0);
 
         // A counter that went backwards is a reset, not a negative rate.
-        let third = reporter.track_stats(&at(1_000), &tracks(), &HashSet::new(), 10_000.0);
+        let third = send_batch(
+            &mut reporter,
+            &at(1_000),
+            &tracks(),
+            &HashSet::new(),
+            10_000.0,
+        );
         assert!(!by_name(&third, "main_video")
             .metrics
             .contains_key("bitrate_bps"));
+    }
+
+    fn stage_names(stat: &ClientTrackStat) -> Vec<(&str, u64)> {
+        stat.frame_stages
+            .iter()
+            .map(|s| (s.name.as_str(), s.frames))
+            .collect()
+    }
+
+    #[test]
+    fn a_stage_is_what_the_engine_timed_since_the_previous_batch() {
+        let mut reporter = ClientStatsReporter::new();
+        let batch = |frames: u32, seconds: f64, emitted: u64, waited_s: f64, encoded: u32| {
+            let mut r = received(1, "0", "video/VP8", 0);
+            r.frames_decoded = frames;
+            r.total_decode_time_s = seconds;
+            r.jitter_buffer_emitted_count = emitted;
+            r.jitter_buffer_delay_s = waited_s;
+            let mut s = sent(2, "2", "video/VP8", 0);
+            s.frames_encoded = encoded;
+            s.total_encode_time_s = f64::from(encoded) * 0.002;
+            TransportStats {
+                inbound: vec![r],
+                outbound: vec![s],
+                ..TransportStats::default()
+            }
+        };
+
+        let first = send_batch(
+            &mut reporter,
+            &batch(100, 0.1, 100, 1.2, 100),
+            &tracks(),
+            &HashSet::new(),
+            0.0,
+        );
+        let second = send_batch(
+            &mut reporter,
+            &batch(250, 0.25, 248, 3.0, 250),
+            &tracks(),
+            &HashSet::new(),
+            5_000.0,
+        );
+
+        assert!(
+            first.iter().all(|s| s.frame_stages.is_empty()),
+            "a first batch has no window"
+        );
+        let video = by_name(&second, "main_video");
+        assert_eq!(
+            stage_names(video),
+            [("jitter_buffer", 148), ("decode", 150)]
+        );
+        assert!((video.frame_stages[0].total_ms - 1_800.0).abs() < 1e-6);
+        assert!((video.frame_stages[1].total_ms - 150.0).abs() < 1e-6);
+        let webcam = by_name(&second, "webcam");
+        assert_eq!(stage_names(webcam), [("encode", 150)]);
+        assert!((webcam.frame_stages[0].total_ms - 300.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_total_that_is_not_a_number_starts_a_fresh_window() {
+        let mut reporter = ClientStatsReporter::new();
+        let batch = |frames: u32, seconds: f64| {
+            let mut s = sent(2, "2", "video/VP8", 0);
+            s.frames_encoded = frames;
+            s.total_encode_time_s = seconds;
+            TransportStats {
+                outbound: vec![s],
+                ..TransportStats::default()
+            }
+        };
+        let encode = |stats: &[ClientTrackStat]| by_name(stats, "webcam").frame_stages.clone();
+        let paused = HashSet::new();
+
+        send_batch(&mut reporter, &batch(100, 0.2), &tracks(), &paused, 0.0);
+        let after_nan = send_batch(
+            &mut reporter,
+            &batch(130, f64::NAN),
+            &tracks(),
+            &paused,
+            5_000.0,
+        );
+        let first_finite = send_batch(
+            &mut reporter,
+            &batch(160, 0.32),
+            &tracks(),
+            &paused,
+            10_000.0,
+        );
+        let next = send_batch(
+            &mut reporter,
+            &batch(190, 0.38),
+            &tracks(),
+            &paused,
+            15_000.0,
+        );
+
+        assert!(encode(&after_nan).is_empty());
+        assert!(
+            encode(&first_finite).is_empty(),
+            "no finite baseline to difference against"
+        );
+        let [stage] = encode(&next).try_into().expect("one stage");
+        assert_eq!(stage.frames, 30);
+        assert!((stage.total_ms - 60.0).abs() < 1e-6);
+    }
+
+    /// A batch the reporter builds and that goes out, as the stats loop does.
+    fn send_batch(
+        reporter: &mut ClientStatsReporter,
+        raw: &TransportStats,
+        tracks: &[TrackMappingEntry],
+        paused: &HashSet<String>,
+        now_ms: f64,
+    ) -> Vec<ClientTrackStat> {
+        let stats = reporter.track_stats(raw, tracks, paused, now_ms);
+        reporter.commit();
+        stats
+    }
+
+    #[test]
+    fn a_batch_that_is_not_sent_leaves_its_interval_to_the_next() {
+        let mut reporter = ClientStatsReporter::new();
+        let batch = |frames: u32, seconds: f64, bytes: u64| {
+            let mut s = sent(2, "2", "video/VP8", bytes);
+            s.frames_encoded = frames;
+            s.total_encode_time_s = seconds;
+            TransportStats {
+                outbound: vec![s],
+                ..TransportStats::default()
+            }
+        };
+
+        send_batch(
+            &mut reporter,
+            &batch(100, 0.2, 10_000),
+            &tracks(),
+            &HashSet::new(),
+            0.0,
+        );
+        // Built but rejected: no commit.
+        reporter.track_stats(
+            &batch(130, 0.26, 20_000),
+            &tracks(),
+            &HashSet::new(),
+            5_000.0,
+        );
+        let next = send_batch(
+            &mut reporter,
+            &batch(160, 0.32, 30_000),
+            &tracks(),
+            &HashSet::new(),
+            10_000.0,
+        );
+
+        let webcam = by_name(&next, "webcam");
+        assert_eq!(stage_names(webcam), [("encode", 60)]);
+        assert!((webcam.frame_stages[0].total_ms - 120.0).abs() < 1e-6);
+        // 20 000 bytes over the 10 s since the last batch that went out.
+        assert_eq!(webcam.metrics["bitrate_bps"], 16_000.0);
+    }
+
+    #[test]
+    fn a_timing_frame_in_a_batch_that_is_not_sent_still_counts() {
+        let mut reporter = ClientStatsReporter::new();
+        let batch = |rtp_timestamp: u32| {
+            let mut r = received(1, "0", "video/VP8", 0);
+            r.timing_frame = Some(TimingFrame {
+                rtp_timestamp,
+                encode_wait_ms: 1.0,
+                packetize_ms: 2.0,
+                pacer_ms: 3.0,
+            });
+            TransportStats {
+                inbound: vec![r],
+                ..TransportStats::default()
+            }
+        };
+
+        reporter.track_stats(&batch(9_000), &tracks(), &HashSet::new(), 0.0);
+        let resent = send_batch(
+            &mut reporter,
+            &batch(9_000),
+            &tracks(),
+            &HashSet::new(),
+            5_000.0,
+        );
+
+        assert_eq!(
+            stage_names(by_name(&resent, "main_video")),
+            [("encode_wait", 1), ("packetize", 1), ("pacer", 1)]
+        );
+    }
+
+    #[test]
+    fn a_stage_whose_total_went_backwards_is_left_out() {
+        let mut reporter = ClientStatsReporter::new();
+        let batch = |frames: u32, seconds: f64| {
+            let mut s = sent(2, "2", "video/VP8", 0);
+            s.frames_encoded = frames;
+            s.total_encode_time_s = seconds;
+            TransportStats {
+                outbound: vec![s],
+                ..TransportStats::default()
+            }
+        };
+
+        send_batch(
+            &mut reporter,
+            &batch(500, 1.0),
+            &tracks(),
+            &HashSet::new(),
+            0.0,
+        );
+        let stats = send_batch(
+            &mut reporter,
+            &batch(20, 0.04),
+            &tracks(),
+            &HashSet::new(),
+            5_000.0,
+        );
+
+        assert!(by_name(&stats, "webcam").frame_stages.is_empty());
+    }
+
+    #[test]
+    fn a_stage_the_sender_did_not_stamp_is_left_out() {
+        let mut r = received(1, "0", "video/VP8", 0);
+        r.timing_frame = Some(TimingFrame {
+            rtp_timestamp: 9_000,
+            encode_wait_ms: 1.0,
+            packetize_ms: 0.0,
+            pacer_ms: -1_000.0,
+        });
+        let raw = TransportStats {
+            inbound: vec![r],
+            ..TransportStats::default()
+        };
+
+        let stats = ClientStatsReporter::new().track_stats(&raw, &tracks(), &HashSet::new(), 0.0);
+
+        assert_eq!(
+            stage_names(by_name(&stats, "main_video")),
+            [("encode_wait", 1), ("packetize", 1)]
+        );
+    }
+
+    #[test]
+    fn a_timing_frame_counts_once_as_the_senders_stages() {
+        let mut reporter = ClientStatsReporter::new();
+        let batch = |rtp_timestamp: u32| {
+            let mut r = received(1, "0", "video/VP8", 0);
+            r.timing_frame = Some(TimingFrame {
+                rtp_timestamp,
+                encode_wait_ms: 1.0,
+                packetize_ms: 0.0,
+                pacer_ms: 2.0,
+            });
+            TransportStats {
+                inbound: vec![r],
+                ..TransportStats::default()
+            }
+        };
+
+        let first = send_batch(
+            &mut reporter,
+            &batch(9_000),
+            &tracks(),
+            &HashSet::new(),
+            0.0,
+        );
+        let repeated = send_batch(
+            &mut reporter,
+            &batch(9_000),
+            &tracks(),
+            &HashSet::new(),
+            5_000.0,
+        );
+
+        assert_eq!(
+            stage_names(by_name(&first, "main_video")),
+            [("encode_wait", 1), ("packetize", 1), ("pacer", 1)]
+        );
+        assert!(by_name(&repeated, "main_video").frame_stages.is_empty());
+    }
+
+    #[test]
+    fn audio_reports_no_stages() {
+        let mut reporter = ClientStatsReporter::new();
+        let batch = |frames: u32| {
+            let mut r = received(1, "1", "audio/opus", 0);
+            r.frames_decoded = frames;
+            r.total_decode_time_s = f64::from(frames) * 0.001;
+            TransportStats {
+                inbound: vec![r],
+                ..TransportStats::default()
+            }
+        };
+
+        send_batch(&mut reporter, &batch(10), &tracks(), &HashSet::new(), 0.0);
+        let stats = send_batch(
+            &mut reporter,
+            &batch(20),
+            &tracks(),
+            &HashSet::new(),
+            5_000.0,
+        );
+
+        assert!(by_name(&stats, "main_audio").frame_stages.is_empty());
     }
 
     #[test]
