@@ -25,6 +25,27 @@ pub trait Platform {
     fn monotonic_ms(&self) -> f64 {
         self.now_ms()
     }
+    /// The system the client runs on, for its stats readings. Every field
+    /// defaults to empty: unknown.
+    fn info(&self) -> PlatformInfo {
+        PlatformInfo::default()
+    }
+}
+
+/// The system a client runs on, as its [`Platform`] reads it. A field is
+/// empty when unknown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlatformInfo {
+    /// The operating system, e.g. `"macos"`, `"linux"`, `"windows"`, `"ios"`,
+    /// `"android"`, or `"browser"`.
+    pub os: String,
+    /// The operating system's version, e.g. `"15.1"`.
+    pub os_version: String,
+    /// The CPU architecture, e.g. `"aarch64"`, `"x86_64"`.
+    pub arch: String,
+    /// The device's hardware model, e.g. `"iPhone15,2"`, `"Pixel 8"` or
+    /// `"MacBookPro18,3"`.
+    pub device_model: String,
 }
 
 /// Race `fut` against a platform sleep.
@@ -51,6 +72,17 @@ pub async fn timeout<T>(
 pub struct TokioPlatform;
 
 #[cfg(feature = "tokio-platform")]
+impl TokioPlatform {
+    /// The platform, with [`Platform::info`] already read, so no task ever
+    /// blocks on the system calls behind it.
+    pub fn new() -> Self {
+        let platform = Self;
+        platform.info();
+        platform
+    }
+}
+
+#[cfg(feature = "tokio-platform")]
 impl Platform for TokioPlatform {
     fn sleep(&self, duration: Duration) -> BoxFut<'static, ()> {
         Box::pin(tokio::time::sleep(duration))
@@ -61,6 +93,27 @@ impl Platform for TokioPlatform {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64() * 1000.0)
             .unwrap_or(0.0)
+    }
+
+    /// Read once per process, since it cannot change while the process runs:
+    /// the first read does blocking system calls, so a host warms it up with
+    /// [`TokioPlatform::new`] rather than in a task.
+    fn info(&self) -> PlatformInfo {
+        static INFO: std::sync::OnceLock<PlatformInfo> = std::sync::OnceLock::new();
+        INFO.get_or_init(|| {
+            let version = os_info::get().version().to_string();
+            PlatformInfo {
+                os: std::env::consts::OS.to_string(),
+                os_version: if version == "Unknown" {
+                    String::new()
+                } else {
+                    crate::stats::bounded_name(&version)
+                },
+                arch: std::env::consts::ARCH.to_string(),
+                device_model: crate::device::model(),
+            }
+        })
+        .clone()
     }
 
     fn monotonic_ms(&self) -> f64 {

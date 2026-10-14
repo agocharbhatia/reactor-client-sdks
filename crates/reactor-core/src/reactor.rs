@@ -33,8 +33,8 @@ use crate::protocol::wire::v1::control::control_client_message::Payload as Clien
 use crate::protocol::wire::v1::control::control_server_message::Payload as ServerPayload;
 use crate::protocol::wire::v1::data::{data_client_message, data_server_message};
 use crate::protocol::wire::v1::platform::{
-    ClientConnectionStat, ClientStats, ClientTrackStat, FileUploaded, FrameStage, Ping,
-    RequestClip, RequestRecording, RequestSchema,
+    ClientConnectionStat, ClientEnvironment, ClientStats, ClientTrackStat, FileUploaded,
+    FrameStage, Ping, RequestClip, RequestRecording, RequestSchema,
 };
 use crate::protocol::wire::v1::track::{PauseTrack, PublishTrack, ResumeTrack, UnpublishTrack};
 use crate::recording::{clip_failed_code, clip_from_ready, Clip};
@@ -1032,6 +1032,23 @@ impl Reactor {
         self.peer.send_control(&payload)
     }
 
+    /// What this client runs on, for its stats readings: the SDK and version
+    /// the binding declared, and the system its platform reads.
+    pub fn client_environment(&self) -> ClientEnvironment {
+        let client = self.coordinator.client_info();
+        let platform = self.platform.info();
+        // Each value bounded, so no one of them gets a reading refused.
+        let bounded = |value: &str| crate::stats::bounded_name(value);
+        ClientEnvironment {
+            sdk_type: bounded(&client.sdk_type),
+            sdk_version: bounded(&client.sdk_version),
+            os: bounded(&platform.os),
+            os_version: bounded(&platform.os_version),
+            arch: bounded(&platform.arch),
+            device_model: bounded(&platform.device_model),
+        }
+    }
+
     /// Share the [`StageTimes`] the host adds the stages it times to: a
     /// decoded frame reaches the app outside the core.
     pub fn with_stage_times(mut self, stage_times: Arc<StageTimes>) -> Self {
@@ -1527,6 +1544,10 @@ impl Reactor {
         let generation = self.stage_times.generation();
         let mut reporter = ClientStatsReporter::new();
         let mut sent_connect_time = false;
+        // Fixed for the connection, sent on every batch so any one reading
+        // can be grouped on its own.
+        let environment = self.client_environment();
+        let mut sent_environment = false;
         loop {
             self.platform.sleep(interval).await;
             if !current() {
@@ -1558,8 +1579,12 @@ impl Reactor {
             };
             let mut track_stats = reporter.track_stats(&raw, &tracks, &paused, now);
             let unmatched = add_sdk_stages(&mut track_stats, sdk_stages.clone());
-            let connection_stat = client_connection_stat(&raw, time_to_connect_ms, now);
-            if track_stats.is_empty() && connection_stat.metrics.is_empty() {
+            let connection_stat =
+                client_connection_stat(&raw, time_to_connect_ms, &environment, now);
+            // A batch with no reading goes out once, for the environment it
+            // carries: a connection with no media, or none measured yet,
+            // still says what it runs on.
+            if track_stats.is_empty() && connection_stat.metrics.is_empty() && sent_environment {
                 self.stage_times.give_back(generation, sdk_stages);
                 continue;
             }
@@ -1570,6 +1595,7 @@ impl Reactor {
                     // stages for a batch that has one.
                     self.stage_times.give_back(generation, unmatched);
                     sent_connect_time |= time_to_connect_ms.is_some();
+                    sent_environment = true;
                 }
                 Err(e) => {
                     self.stage_times.give_back(generation, sdk_stages);
@@ -2823,10 +2849,12 @@ mod tests {
                 total_ms: 120.0,
                 frames: 150,
             }],
+            ..ClientTrackStat::default()
         };
         let connection_stat = ClientConnectionStat {
             timestamp: 1_700_000_000_000,
             metrics: HashMap::from([("time_to_connect_ms".to_string(), 850.0)]),
+            ..ClientConnectionStat::default()
         };
 
         reactor
@@ -2854,6 +2882,9 @@ mod tests {
     #[derive(Default)]
     struct StatsPeer {
         sent_control: Mutex<Vec<Vec<u8>>>,
+        /// Report no streams and no candidate pair, as a connection with no
+        /// media measured yet does.
+        no_readings: bool,
     }
 
     #[async_trait::async_trait]
@@ -2882,6 +2913,9 @@ mod tests {
             Ok(())
         }
         async fn get_stats(&self) -> Result<crate::peer::TransportStats, CoreError> {
+            if self.no_readings {
+                return Ok(crate::peer::TransportStats::default());
+            }
             Ok(crate::peer::TransportStats {
                 inbound: vec![crate::peer::InboundRtpStats {
                     ssrc: 7,
@@ -3160,6 +3194,27 @@ mod tests {
             .map(|s| s.frames)
             .collect();
         assert_eq!(submits, [1], "sent once, with the first webcam reading");
+    }
+
+    /// With nothing measured, one batch still goes out, for the environment;
+    /// after that, an empty interval sends nothing.
+    #[tokio::test]
+    async fn the_environment_goes_out_once_with_nothing_measured() {
+        let peer = Arc::new(StatsPeer {
+            no_readings: true,
+            ..StatsPeer::default()
+        });
+        let reactor = make_reactor_with_stats_peer(peer.clone(), Duration::from_millis(10));
+        reactor.state.lock().unwrap().time_to_connect_ms = None;
+
+        report_briefly(&reactor).await;
+
+        let batches = sent_client_stats(&peer);
+        assert_eq!(batches.len(), 1, "got {} batch(es)", batches.len());
+        assert!(batches[0].track_stats.is_empty());
+        let connection = batches[0].connection_stat.as_ref().unwrap();
+        assert!(connection.metrics.is_empty());
+        assert!(connection.environment.is_some());
     }
 
     /// Nothing goes out before an interval has passed, and nothing at all once
