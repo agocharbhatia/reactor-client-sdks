@@ -140,6 +140,9 @@ public final class FakeNativeLibrary implements AutoCloseable {
         bind("reactor_publish_track", Ffi.Symbol.PUBLISH_TRACK.descriptor(), "publishTrack");
         bind("reactor_unpublish_track", Ffi.Symbol.UNPUBLISH_TRACK.descriptor(), "unpublishTrack");
         bind("reactor_push_video_frame", Ffi.Symbol.PUSH_VIDEO_FRAME.descriptor(), "pushVideoFrame");
+        bind("reactor_push_video_frame_timed", Ffi.Symbol.PUSH_VIDEO_FRAME_TIMED.descriptor(), "pushVideoFrameTimed");
+        bind("reactor_frame_delivered", Ffi.Symbol.FRAME_DELIVERED.descriptor(), "frameDelivered");
+        bind("reactor_push_begin", Ffi.Symbol.PUSH_BEGIN.descriptor(), "pushBegin");
         bind("reactor_send_command", Ffi.Symbol.SEND_COMMAND.descriptor(), "sendCommand");
         bind("reactor_request_schema", Ffi.Symbol.REQUEST_SCHEMA.descriptor(), "requestSchema");
         bind("reactor_get_stats", Ffi.Symbol.GET_STATS.descriptor(), "getStats");
@@ -363,8 +366,14 @@ public final class FakeNativeLibrary implements AutoCloseable {
     /** The error {@code reactor_unpublish_track} answers with, or null for success. */
     public @Nullable String unpublishError;
 
-    /** How many frames reached {@code reactor_push_video_frame}. */
+    /** How many frames reached {@code reactor_push_video_frame} or {@code reactor_push_video_frame_timed}. */
     public int videoFramesPushed;
+
+    /** The time the binding reported spending on the last frame it pushed, in milliseconds. */
+    public volatile double lastBindingMs = -1;
+
+    /** How many frames the binding marked as handed to the app. */
+    public volatile int framesDelivered;
 
     private void publishTrack(
             MemorySegment handle, MemorySegment name, MemorySegment completion, MemorySegment userdata) {
@@ -391,6 +400,34 @@ public final class FakeNativeLibrary implements AutoCloseable {
             }
         }
         videoFramesPushed++;
+    }
+
+    private void pushVideoFrameTimed(
+            MemorySegment handle,
+            MemorySegment name,
+            MemorySegment data,
+            int width,
+            int height,
+            MemorySegment userData,
+            int userDataLength,
+            int hasCaptureTime,
+            long captureTimeUs,
+            double bindingMs,
+            long generation) {
+        lastBindingMs = bindingMs;
+        lastGeneration = generation;
+        pushVideoFrame(handle, name, data, width, height);
+    }
+
+    /** The connection the binding read as the app handed over the last frame it pushed. */
+    public volatile long lastGeneration = -1;
+
+    private long pushBegin(MemorySegment handle) {
+        return 7;
+    }
+
+    private void frameDelivered() {
+        framesDelivered++;
     }
 
     /**

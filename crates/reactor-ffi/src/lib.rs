@@ -58,6 +58,7 @@ use reactor_core::protocol::upload::FileRef;
 use reactor_core::reactor::{ConnectOptions, Reactor, ReactorDeps, ReactorOptions};
 use reactor_core::recording::{clip_segment_requests, Readiness};
 use reactor_core::runtime::TokioPlatform;
+use reactor_core::stage_times::{StageTimes, DELIVERY};
 use reactor_core::state::ReactorStatus;
 use reactor_core::{SharedHttp, SharedPlatform};
 use reactor_webrtc::AdmMode;
@@ -224,6 +225,37 @@ struct VideoFrame {
     frame_id: u64,
     timestamp_us: u64,
     user_data: Vec<u8>,
+    /// When the decoder handed the frame over, to time its trip to the host.
+    decoded_at: std::time::Instant,
+    /// The connection the frame was decoded on, so a frame still queued when
+    /// a reconnect begins is not counted in the new connection's stats.
+    generation: u64,
+}
+
+/// The video frame the host's `on_frame` callback is delivering on this
+/// thread, until the binding marks the moment it hands the frame to the app
+/// with [`reactor_frame_delivered`].
+struct Delivering {
+    stage_times: Arc<StageTimes>,
+    track: String,
+    decoded_at: std::time::Instant,
+    generation: u64,
+}
+
+thread_local! {
+    static DELIVERING: std::cell::RefCell<Option<Delivering>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl Delivering {
+    fn record(self) {
+        self.stage_times.add_from(
+            self.generation,
+            &self.track,
+            DELIVERY,
+            self.decoded_at.elapsed().as_secs_f64() * 1_000.0,
+        );
+    }
 }
 
 /// A decoded remote audio frame, likewise copied.
@@ -899,12 +931,14 @@ unsafe fn create_impl(
         Some(mode) => ReactorWebRtcPeerTransport::with_adm_mode(peer_event_tx, mode),
         None => ReactorWebRtcPeerTransport::new(peer_event_tx),
     };
+    let stage_times = Arc::new(StageTimes::new());
     let mut video: Option<HostThread<VideoFrame>> = None;
     let mut audio: Option<HostThread<AudioFrame>> = None;
     if !callbacks.is_null() {
         let c = &*callbacks;
         if let Some(frame_fn) = c.on_frame {
             let userdata_usize = c.userdata as usize;
+            let delivered = stage_times.clone();
             // Capacity one, newest wins: a frame the host could not keep up with is
             // stale by the time it would be delivered, so queueing it would only add
             // latency. This is also what bounds memory when the host falls behind.
@@ -914,6 +948,17 @@ unsafe fn create_impl(
                 Overflow::DropOldest,
                 gate.clone(),
                 move |frame: VideoFrame| unsafe {
+                    // `delivery` ends where the binding hands the frame to the
+                    // app, which it marks with reactor_frame_delivered() from
+                    // inside this callback. A frame it returns without marking
+                    // never reached the app, and is not counted.
+                    let delivering = Delivering {
+                        stage_times: delivered.clone(),
+                        track: frame.track.to_string_lossy().into_owned(),
+                        decoded_at: frame.decoded_at,
+                        generation: frame.generation,
+                    };
+                    DELIVERING.with(|d| *d.borrow_mut() = Some(delivering));
                     frame_fn(
                         frame.track.as_ptr(),
                         frame.bgra.as_ptr(),
@@ -928,14 +973,18 @@ unsafe fn create_impl(
                         },
                         frame.user_data.len() as u32,
                         userdata_usize as *mut c_void,
-                    )
+                    );
+                    DELIVERING.with(|d| d.borrow_mut().take());
                 },
             );
             let tx = thread.sender();
+            let decoding = stage_times.clone();
             peer_transport =
                 peer_transport.with_frame_callback(move |track, data, w, h, frame_id, ts, ud| {
                     // Runs on a libwebrtc decode thread. Copy and hand off; the one
-                    // thing not to do here is wait for the host.
+                    // thing not to do here is wait for the host. Timed before the
+                    // copy, so the copy counts toward delivery.
+                    let decoded_at = std::time::Instant::now();
                     tx.send(VideoFrame {
                         track: CString::new(track).unwrap_or_default(),
                         bgra: data.to_vec(),
@@ -944,6 +993,8 @@ unsafe fn create_impl(
                         frame_id,
                         timestamp_us: ts,
                         user_data: ud.to_vec(),
+                        decoded_at,
+                        generation: decoding.generation(),
                     });
                 });
             video = Some(thread);
@@ -997,7 +1048,7 @@ unsafe fn create_impl(
         platform,
         peer: peer_transport,
     };
-    let reactor = Arc::new(Reactor::new(deps, options));
+    let reactor = Arc::new(Reactor::new(deps, options).with_stage_times(stage_times));
     let tasks: TaskSet = Arc::new(Mutex::new(Vec::new()));
 
     let reactor2 = reactor.clone();
@@ -1926,6 +1977,84 @@ pub unsafe extern "C" fn reactor_push_video_frame_with_metadata(
         .push_video_frame_with_metadata(&name, slice, width, height, tag);
 }
 
+/// Mark the moment the binding hands the video frame it is delivering to the
+/// app, from inside its `on_frame` callback: the frame's `delivery` stage ends
+/// here rather than when the callback started, so the binding's own copying
+/// and routing count toward it. Call it once, right before the app's handler
+/// runs, on the thread the callback runs on; a call anywhere else does
+/// nothing.
+#[no_mangle]
+pub extern "C" fn reactor_frame_delivered() {
+    if let Some(delivering) = DELIVERING.with(|d| d.borrow_mut().take()) {
+        delivering.record();
+    }
+}
+
+/// The connection a frame push belongs to. A binding reads it as the app
+/// hands it a frame, before its own work, and passes it to
+/// [`reactor_push_video_frame_timed`], so a reconnect during that work leaves
+/// the frame with the connection it was pushed on. 0 for a null handle.
+///
+/// # Safety
+///
+/// `handle` must come from `reactor_new`, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn reactor_push_begin(handle: *mut ReactorHandle) -> u64 {
+    if handle.is_null() {
+        return 0;
+    }
+    (*handle).reactor.push_begin()
+}
+
+/// Push a BGRA frame the binding has already spent `binding_ms` milliseconds
+/// on since the app handed it over, so the binding's own copying or
+/// conversion counts toward the frame's `submit` stage; `generation` is what
+/// [`reactor_push_begin`] returned then. Tagged with `user_data` when
+/// `user_data_len` is not 0, and stamped with `capture_time_us` (see
+/// [`reactor_push_video_frame_with_metadata_at`]) when `has_capture_time` is
+/// not 0; otherwise the same as the other push exports.
+///
+/// # Safety
+///
+/// As [`reactor_push_video_frame_with_metadata_at`].
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn reactor_push_video_frame_timed(
+    handle: *mut ReactorHandle,
+    track_name: *const c_char,
+    data: *const u8,
+    width: u32,
+    height: u32,
+    user_data: *const u8,
+    user_data_len: u32,
+    has_capture_time: c_int,
+    capture_time_us: i64,
+    binding_ms: c_double,
+    generation: u64,
+) {
+    if handle.is_null() || track_name.is_null() || data.is_null() {
+        return;
+    }
+    let name = CStr::from_ptr(track_name).to_string_lossy();
+    let n = (width * height * 4) as usize;
+    let slice = std::slice::from_raw_parts(data, n);
+    let tag: &[u8] = if user_data.is_null() || user_data_len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(user_data, user_data_len as usize)
+    };
+    (*handle).reactor.push_video_frame_timed(
+        &name,
+        slice,
+        width,
+        height,
+        tag,
+        (has_capture_time != 0).then_some(capture_time_us),
+        binding_ms,
+        generation,
+    );
+}
+
 /// The engine's monotonic clock in microseconds — the epoch
 /// [`reactor_push_video_frame_with_metadata_at`] reads its capture time in.
 ///
@@ -2040,6 +2169,29 @@ pub unsafe extern "C" fn reactor_push_audio_frame(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The binding's mark ends the delivering frame's stage once; a mark with
+    /// no frame being delivered on this thread does nothing.
+    #[test]
+    fn a_delivery_mark_ends_the_delivering_frames_stage_once() {
+        let stage_times = Arc::new(StageTimes::new());
+        let generation = stage_times.generation();
+        DELIVERING.with(|d| {
+            *d.borrow_mut() = Some(Delivering {
+                stage_times: stage_times.clone(),
+                track: "main_video".to_string(),
+                decoded_at: std::time::Instant::now(),
+                generation,
+            })
+        });
+
+        reactor_frame_delivered();
+        reactor_frame_delivered();
+
+        let stages = stage_times.take_from(generation).unwrap();
+        assert_eq!(stages["main_video"][0].name, DELIVERY);
+        assert_eq!(stages["main_video"][0].frames, 1);
+    }
 
     /// Every entry point documents null as accepted-and-handled, and bindings lean
     /// on it: a Python `Reactor` reports `"disconnected"` from a client that never

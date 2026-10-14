@@ -7,8 +7,8 @@
 //! corresponding status update always happen in the **same** lock
 //! acquisition so that two concurrent callers cannot both pass the guard.
 
-use std::collections::{BTreeMap, HashSet};
-use std::sync::Mutex;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::channel::oneshot;
@@ -33,13 +33,14 @@ use crate::protocol::wire::v1::control::control_client_message::Payload as Clien
 use crate::protocol::wire::v1::control::control_server_message::Payload as ServerPayload;
 use crate::protocol::wire::v1::data::{data_client_message, data_server_message};
 use crate::protocol::wire::v1::platform::{
-    ClientConnectionStat, ClientStats, ClientTrackStat, FileUploaded, Ping, RequestClip,
-    RequestRecording, RequestSchema,
+    ClientConnectionStat, ClientStats, ClientTrackStat, FileUploaded, FrameStage, Ping,
+    RequestClip, RequestRecording, RequestSchema,
 };
 use crate::protocol::wire::v1::track::{PauseTrack, PublishTrack, ResumeTrack, UnpublishTrack};
 use crate::recording::{clip_failed_code, clip_from_ready, Clip};
 use crate::runtime::timeout;
 use crate::signaling::WebRtcSignaling;
+use crate::stage_times::{sort_stages, StageTimes, SUBMIT};
 use crate::state::ReactorStatus;
 use crate::stats::{client_connection_stat, ClientStatsReporter, ConnectionStats, StatsSampler};
 use crate::{SharedAuth, SharedHttp, SharedPeer, SharedPlatform};
@@ -220,6 +221,8 @@ pub struct Reactor {
     state: Mutex<State>,
     /// Holds the previous stats sample, so `get_stats` can answer with rates.
     stats: StatsSampler,
+    /// The stages the SDK times itself, reported with the client stats.
+    stage_times: Arc<StageTimes>,
 }
 
 impl Reactor {
@@ -254,6 +257,7 @@ impl Reactor {
             control: ControlCorrelator::new(),
             data: DataCorrelator::new(),
             stats: StatsSampler::new(),
+            stage_times: Arc::new(StageTimes::new()),
             state: Mutex::new(State {
                 auto_resume_tracks: options.auto_resume_tracks,
                 sdp_max_attempts: options.sdp_poll.max_attempts,
@@ -324,6 +328,10 @@ impl Reactor {
                 state.sdp_max_attempts = attempts;
             }
         }
+        // Frames timed before this connection belong to no batch of it. Cleared
+        // here, at the boundary, not when the reporter task first runs: the host
+        // can push frames before that.
+        self.stage_times.begin_connection();
         self.dispatcher
             .dispatch(ReactorEvent::StatusChanged(ReactorStatus::Connecting));
 
@@ -472,6 +480,8 @@ impl Reactor {
             state.time_to_connect_ms = None;
             sid
         };
+        // As in connect(): the previous connection's frames end here.
+        self.stage_times.begin_connection();
         self.dispatcher
             .dispatch(ReactorEvent::StatusChanged(ReactorStatus::Connecting));
         self.set_status(ReactorStatus::Waiting);
@@ -1022,8 +1032,35 @@ impl Reactor {
         self.peer.send_control(&payload)
     }
 
+    /// Share the [`StageTimes`] the host adds the stages it times to: a
+    /// decoded frame reaches the app outside the core.
+    pub fn with_stage_times(mut self, stage_times: Arc<StageTimes>) -> Self {
+        self.stage_times = stage_times;
+        self
+    }
+
+    /// Start timing one frame's hand-off to the engine: the time on the
+    /// platform's monotonic clock, and the connection it belongs to.
+    fn submit_started(&self) -> (f64, u64) {
+        (self.platform.monotonic_ms(), self.stage_times.generation())
+    }
+
+    /// Time one frame's hand-off to the engine, from [`Self::submit_started`].
+    /// A push that a reconnect overtook belongs to the old connection, so it
+    /// is left out of the new one's stats.
+    fn submitted(&self, track_name: &str, (started_ms, generation): (f64, u64)) {
+        self.stage_times.add_from(
+            generation,
+            track_name,
+            SUBMIT,
+            self.platform.monotonic_ms() - started_ms,
+        );
+    }
+
     pub fn push_video_frame(&self, track_name: &str, data: &[u8], width: u32, height: u32) {
+        let started = self.submit_started();
         self.peer.push_video_frame(track_name, data, width, height);
+        self.submitted(track_name, started);
     }
 
     /// Push a frame tagged with `user_data`, which reaches the far end as the
@@ -1036,8 +1073,10 @@ impl Reactor {
         height: u32,
         user_data: &[u8],
     ) {
+        let started = self.submit_started();
         self.peer
             .push_video_frame_with_metadata(track_name, data, width, height, user_data);
+        self.submitted(track_name, started);
     }
 
     /// Push a tagged frame stamped with `capture_time_us` (microseconds), the
@@ -1053,6 +1092,7 @@ impl Reactor {
         user_data: &[u8],
         capture_time_us: i64,
     ) {
+        let started = self.submit_started();
         self.peer.push_video_frame_with_metadata_at(
             track_name,
             data,
@@ -1061,6 +1101,52 @@ impl Reactor {
             user_data,
             capture_time_us,
         );
+        self.submitted(track_name, started);
+    }
+
+    /// The connection a frame push belongs to, for a host binding to read as
+    /// the app hands it a frame and pass to [`Self::push_video_frame_timed`]:
+    /// a reconnect during the binding's own work must not move the frame to
+    /// the new connection.
+    pub fn push_begin(&self) -> u64 {
+        self.stage_times.generation()
+    }
+
+    /// Push a frame the host binding has already spent *binding_ms*
+    /// milliseconds on, since the app handed it over: the binding's own copy
+    /// or conversion counts toward `submit` too. *generation* is what
+    /// [`Self::push_begin`] returned then; a frame whose connection has since
+    /// been replaced is left out of the stats. Tagged with `user_data` when
+    /// not empty, and stamped with `capture_time_us` when given, as the other
+    /// push methods do.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_video_frame_timed(
+        &self,
+        track_name: &str,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        user_data: &[u8],
+        capture_time_us: Option<i64>,
+        binding_ms: f64,
+        generation: u64,
+    ) {
+        let now_ms = self.platform.monotonic_ms();
+        let binding_ms = if binding_ms.is_finite() {
+            binding_ms.max(0.0)
+        } else {
+            0.0
+        };
+        match capture_time_us {
+            Some(at) => self
+                .peer
+                .push_video_frame_with_metadata_at(track_name, data, width, height, user_data, at),
+            None if !user_data.is_empty() => self
+                .peer
+                .push_video_frame_with_metadata(track_name, data, width, height, user_data),
+            None => self.peer.push_video_frame(track_name, data, width, height),
+        }
+        self.submitted(track_name, (now_ms - binding_ms, generation));
     }
 
     /// Push interleaved PCM with its capture format, before transport resampling.
@@ -1436,6 +1522,9 @@ impl Reactor {
                 && !state.closing
                 && state.status == ReactorStatus::Ready
         };
+        // This connection's stage times; a newer connection's are not this
+        // reporter's to send.
+        let generation = self.stage_times.generation();
         let mut reporter = ClientStatsReporter::new();
         let mut sent_connect_time = false;
         loop {
@@ -1464,17 +1553,28 @@ impl Reactor {
                 )
             };
             let now = self.platform.now_ms();
-            let track_stats = reporter.track_stats(&raw, &tracks, &paused, now);
+            let Some(sdk_stages) = self.stage_times.take_from(generation) else {
+                break;
+            };
+            let mut track_stats = reporter.track_stats(&raw, &tracks, &paused, now);
+            let unmatched = add_sdk_stages(&mut track_stats, sdk_stages.clone());
             let connection_stat = client_connection_stat(&raw, time_to_connect_ms, now);
             if track_stats.is_empty() && connection_stat.metrics.is_empty() {
+                self.stage_times.give_back(generation, sdk_stages);
                 continue;
             }
             match self.client_stats(track_stats, Some(connection_stat)) {
                 Ok(()) => {
                     reporter.commit();
+                    // A track the engine has no reading for yet keeps its
+                    // stages for a batch that has one.
+                    self.stage_times.give_back(generation, unmatched);
                     sent_connect_time |= time_to_connect_ms.is_some();
                 }
-                Err(e) => log::debug!("[reactor] client stats send skipped: {e}"),
+                Err(e) => {
+                    self.stage_times.give_back(generation, sdk_stages);
+                    log::debug!("[reactor] client stats send skipped: {e}");
+                }
             }
         }
     }
@@ -1584,6 +1684,23 @@ impl Reactor {
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
+
+/// Add the stages the SDK timed to the reading of the track they belong to,
+/// in trip order, and return those of a track with no reading in the batch:
+/// a frame can be timed before the engine reports its stream, and its stages
+/// wait for a batch that has one.
+fn add_sdk_stages(
+    stats: &mut [ClientTrackStat],
+    mut sdk: HashMap<String, Vec<FrameStage>>,
+) -> HashMap<String, Vec<FrameStage>> {
+    for stat in stats.iter_mut() {
+        if let Some(stages) = sdk.remove(&stat.track_name) {
+            stat.frame_stages.extend(stages);
+            sort_stages(&mut stat.frame_stages);
+        }
+    }
+    sdk
+}
 
 #[cfg(test)]
 mod tests {
@@ -2774,13 +2891,21 @@ mod tests {
                     packets_received: 10,
                     ..crate::peer::InboundRtpStats::default()
                 }],
+                // On a mid only a test that maps a sent track reports.
+                outbound: vec![crate::peer::OutboundRtpStats {
+                    ssrc: 8,
+                    kind: crate::peer::StreamKind::Video,
+                    mid: Some("1".to_string()),
+                    codec_mime_type: Some("video/VP8".to_string()),
+                    packets_sent: 10,
+                    ..crate::peer::OutboundRtpStats::default()
+                }],
                 candidate_pairs: vec![crate::peer::CandidatePairStats {
                     current_round_trip_time_s: 0.02,
                     state: crate::peer::CandidatePairState::Succeeded,
                     nominated: true,
                     ..crate::peer::CandidatePairStats::default()
                 }],
-                ..crate::peer::TransportStats::default()
             })
         }
         async fn close(&self) -> Result<(), CoreError> {
@@ -2861,6 +2986,180 @@ mod tests {
             let expected = (i == 0).then_some(&812.346);
             assert_eq!(metrics.get("time_to_connect_ms"), expected, "batch {i}");
         }
+    }
+
+    /// A frame the SDK timed before the reporter task first ran belongs to this
+    /// connection, so it goes out in the first batch.
+    #[tokio::test]
+    async fn stage_times_from_before_the_reporter_ran_reach_the_first_batch() {
+        let peer = Arc::new(StatsPeer::default());
+        let reactor = make_reactor_with_stats_peer(peer.clone(), Duration::from_millis(20));
+        reactor
+            .stage_times
+            .add("main_video", crate::stage_times::DELIVERY, 1.5);
+
+        let r = reactor.clone();
+        let task = tokio::spawn(async move { r.run_client_stats().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        reactor.state.lock().unwrap().heartbeat_epoch += 1;
+        tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .expect("the reporter exits when the epoch changes")
+            .unwrap();
+
+        let first = &sent_client_stats(&peer)[0].track_stats[0];
+        let delivery = first
+            .frame_stages
+            .iter()
+            .find(|s| s.name == crate::stage_times::DELIVERY)
+            .expect("the delivery timed before the reporter ran");
+        assert_eq!(delivery.frames, 1);
+    }
+
+    /// Run the reporter for a few intervals, until the epoch moves on.
+    async fn report_briefly(reactor: &Arc<Reactor>) {
+        let r = reactor.clone();
+        let task = tokio::spawn(async move { r.run_client_stats().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        reactor.state.lock().unwrap().heartbeat_epoch += 1;
+        tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .expect("the reporter exits when the epoch changes")
+            .unwrap();
+    }
+
+    fn stage_on<'a>(batch: &'a ClientStats, track: &str, stage: &str) -> Option<&'a FrameStage> {
+        batch
+            .track_stats
+            .iter()
+            .find(|s| s.track_name == track)?
+            .frame_stages
+            .iter()
+            .find(|s| s.name == stage)
+    }
+
+    /// A pushed frame's hand-off is timed on the track it was pushed to and
+    /// goes out with that track's reading.
+    #[tokio::test]
+    async fn a_pushed_frame_reports_submit_on_its_track() {
+        let peer = Arc::new(StatsPeer::default());
+        let reactor = make_reactor_with_stats_peer(peer.clone(), Duration::from_millis(20));
+        reactor
+            .state
+            .lock()
+            .unwrap()
+            .track_mapping
+            .push(TrackMappingEntry {
+                name: "webcam".to_string(),
+                kind: crate::protocol::session::TrackKind::Video,
+                direction: crate::protocol::session::TrackDirection::Sendonly,
+                mid: "1".to_string(),
+            });
+
+        reactor.push_video_frame("webcam", &[0; 16], 2, 2);
+        reactor.push_video_frame("webcam", &[0; 16], 2, 2);
+        report_briefly(&reactor).await;
+
+        let first = &sent_client_stats(&peer)[0];
+        let submit = stage_on(first, "webcam", crate::stage_times::SUBMIT)
+            .expect("submit on the pushed track");
+        assert_eq!(submit.frames, 2);
+        assert!(stage_on(first, "main_video", crate::stage_times::SUBMIT).is_none());
+    }
+
+    /// The time the host binding spent on a frame before handing it over
+    /// counts toward its submit stage.
+    #[test]
+    fn a_timed_push_counts_the_bindings_time_toward_submit() {
+        let reactor = make_reactor();
+        let generation = reactor.push_begin();
+        reactor.push_video_frame_timed("webcam", &[0; 16], 2, 2, &[], None, 3.5, generation);
+        reactor.push_video_frame_timed("webcam", &[0; 16], 2, 2, &[], None, f64::NAN, generation);
+
+        let stages = reactor.stage_times.take_from(generation).unwrap();
+        let submit = &stages["webcam"][0];
+        assert_eq!(submit.frames, 2);
+        // `TestPlatform`'s clock is frozen, so the binding's time is all of it.
+        assert!((submit.total_ms - 3.5).abs() < 1e-9);
+    }
+
+    /// A reconnect that lands while the binding is still working on a frame
+    /// leaves that frame with the old connection.
+    #[test]
+    fn a_reconnect_during_the_bindings_work_keeps_the_frame_out_of_the_new_connection() {
+        let reactor = make_reactor();
+        let generation = reactor.push_begin();
+        // The binding copies the frame; meanwhile the next connection begins.
+        reactor.stage_times.begin_connection();
+        reactor.push_video_frame_timed("webcam", &[0; 16], 2, 2, &[], None, 3.5, generation);
+
+        let current = reactor.push_begin();
+        assert!(reactor.stage_times.take_from(current).unwrap().is_empty());
+    }
+
+    /// A frame timed before `reconnect()` belongs to the old connection, and
+    /// stays out of the new one's first batch.
+    #[tokio::test]
+    async fn a_time_from_before_a_reconnect_stays_out_of_the_new_connection() {
+        let peer = Arc::new(StatsPeer::default());
+        let reactor = make_reactor_with_stats_peer(peer.clone(), Duration::from_millis(20));
+        reactor.state.lock().unwrap().session_id = Some("session".to_string());
+        reactor
+            .stage_times
+            .add("main_video", crate::stage_times::DELIVERY, 1.5);
+
+        // The new connection begins before its transport is up; the fake
+        // HTTP never answers, so stop there.
+        let r = reactor.clone();
+        let reconnecting = tokio::spawn(async move { r.reconnect(None).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        reconnecting.abort();
+        reactor.state.lock().unwrap().status = ReactorStatus::Ready;
+        report_briefly(&reactor).await;
+
+        let batches = sent_client_stats(&peer);
+        assert!(!batches.is_empty());
+        assert!(stage_on(&batches[0], "main_video", crate::stage_times::DELIVERY).is_none());
+    }
+
+    /// A frame timed before the engine reports its track's stream waits for
+    /// the first batch that has a reading for that track.
+    #[tokio::test]
+    async fn stages_of_a_track_with_no_reading_yet_wait_for_one() {
+        let peer = Arc::new(StatsPeer::default());
+        let reactor = make_reactor_with_stats_peer(peer.clone(), Duration::from_millis(20));
+        reactor
+            .stage_times
+            .add("webcam", crate::stage_times::SUBMIT, 2.0);
+
+        // No reading for "webcam" yet: its mid is not mapped.
+        let r = reactor.clone();
+        let task = tokio::spawn(async move { r.run_client_stats().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        reactor
+            .state
+            .lock()
+            .unwrap()
+            .track_mapping
+            .push(TrackMappingEntry {
+                name: "webcam".to_string(),
+                kind: crate::protocol::session::TrackKind::Video,
+                direction: crate::protocol::session::TrackDirection::Sendonly,
+                mid: "1".to_string(),
+            });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        reactor.state.lock().unwrap().heartbeat_epoch += 1;
+        tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .expect("the reporter exits when the epoch changes")
+            .unwrap();
+
+        let submits: Vec<u64> = sent_client_stats(&peer)
+            .iter()
+            .filter_map(|b| stage_on(b, "webcam", crate::stage_times::SUBMIT))
+            .map(|s| s.frames)
+            .collect();
+        assert_eq!(submits, [1], "sent once, with the first webcam reading");
     }
 
     /// Nothing goes out before an interval has passed, and nothing at all once
@@ -3544,5 +3843,36 @@ mod tests {
             .await;
 
         assert!(reactor.state.lock().unwrap().auto_resume_tracks);
+    }
+
+    #[test]
+    fn the_sdks_stages_join_their_tracks_reading_in_trip_order() {
+        use crate::protocol::wire::v1::platform::{FrameStage, TrackDirection};
+        use crate::stage_times::DELIVERY;
+
+        let stage = |name: &str, frames: u64| FrameStage {
+            name: name.to_string(),
+            total_ms: 1.0,
+            frames,
+        };
+        let mut stats = vec![ClientTrackStat {
+            track_name: "main_video".to_string(),
+            direction: TrackDirection::Recvonly as i32,
+            frame_stages: vec![stage("jitter_buffer", 150), stage("decode", 150)],
+            ..ClientTrackStat::default()
+        }];
+        let sdk = HashMap::from([
+            ("main_video".to_string(), vec![stage(DELIVERY, 149)]),
+            ("gone".to_string(), vec![stage(DELIVERY, 1)]),
+        ]);
+
+        add_sdk_stages(&mut stats, sdk);
+
+        let names: Vec<&str> = stats[0]
+            .frame_stages
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(names, ["jitter_buffer", "decode", DELIVERY]);
     }
 }

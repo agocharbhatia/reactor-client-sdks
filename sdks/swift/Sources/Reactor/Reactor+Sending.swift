@@ -83,7 +83,12 @@ extension Reactor {
         userData: UnsafeRawBufferPointer?,
         captureTimeUs: Int64
     ) throws {
+        // The frame's submit stage starts here, so this SDK's own checks count.
+        let started = ContinuousClock.now
         let handle = try requirePushable(track: name, kind: .video, method: "pushFrame")
+        // The connection this frame belongs to; nothing between here and the
+        // push can wait, so a reconnect has no time to land in between.
+        let generation = ffi.pushBegin(handle)
 
         // Checked rather than `Int(width) * Int(height) * 4`: both are UInt32 and
         // the caller picks them, so dimensions near UInt32.max overflow Int and
@@ -115,12 +120,18 @@ extension Reactor {
         }
 
         let base = pixels.bindMemory(to: UInt8.self).baseAddress
+        let elapsed = ContinuousClock.now - started
+        let bindingMs =
+            Double(elapsed.components.seconds) * 1_000
+            + Double(elapsed.components.attoseconds) / 1e15
         if let userData, !userData.isEmpty {
             let tag = userData.bindMemory(to: UInt8.self).baseAddress
             ffi.pushVideoFrame(
-                handle, name, base, width, height, tag, UInt32(userData.count), captureTimeUs)
+                handle, name, base, width, height, tag, UInt32(userData.count), captureTimeUs,
+                bindingMs, generation)
         } else {
-            ffi.pushVideoFrame(handle, name, base, width, height, nil, 0, captureTimeUs)
+            ffi.pushVideoFrame(
+                handle, name, base, width, height, nil, 0, captureTimeUs, bindingMs, generation)
         }
     }
 
