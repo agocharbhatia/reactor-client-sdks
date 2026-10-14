@@ -16,7 +16,7 @@ use reactor_core::error::CoreError;
 use reactor_core::peer::{
     CandidatePairState, CandidatePairStats, IceCandidateType, InboundRtpStats, OutboundRtpStats,
     PeerConnectionState as CorePeerConnectionState, PeerEvent, PeerTransport, PreparedOffer,
-    RelayProtocol, StreamKind, TransportStats,
+    RelayProtocol, StreamKind, TimingFrame, TransportStats,
 };
 use reactor_core::protocol::session::{TrackCapability, TrackDirection, TrackKind};
 use reactor_core::protocol::webrtc::{IceCandidate, IceServer, TrackMappingEntry};
@@ -168,10 +168,11 @@ fn map_pair_state(s: IceCandidatePairState) -> CandidatePairState {
 
 /// Translate the engine's report into the core's vocabulary.
 ///
-/// Field for field — the core's structs were shaped from this report, so there is
-/// nothing to compute here and nothing to drop. Only the enums need mapping,
-/// because the core cannot name `reactor-webrtc`'s: it does not depend on it, and
-/// must not, since the wasm build has no libwebrtc at all.
+/// Mostly field for field — the core's structs were shaped from this report. The
+/// enums need mapping, because the core cannot name `reactor-webrtc`'s: it does
+/// not depend on it, and must not, since the wasm build has no libwebrtc at all.
+/// A timing frame's sender stamps become the stage durations the core reports;
+/// see [`timing_frame`].
 fn map_stats(report: StatsReport) -> TransportStats {
     TransportStats {
         inbound: report
@@ -195,6 +196,9 @@ fn map_stats(report: StatsReport) -> TransportStats {
                 frames_dropped: s.frames_dropped,
                 frame_width: s.frame_width,
                 frame_height: s.frame_height,
+                jitter_buffer_delay_s: s.jitter_buffer_delay_s,
+                jitter_buffer_emitted_count: s.jitter_buffer_emitted_count,
+                timing_frame: s.timing_frame.map(timing_frame),
             })
             .collect(),
         outbound: report
@@ -220,6 +224,8 @@ fn map_stats(report: StatsReport) -> TransportStats {
                 frames_sent: s.frames_sent,
                 frame_width: s.frame_width,
                 frame_height: s.frame_height,
+                frames_encoded: s.frames_encoded,
+                total_encode_time_s: s.total_encode_time_s,
             })
             .collect(),
         candidate_pairs: report
@@ -983,6 +989,47 @@ impl PeerTransport for ReactorWebRtcPeerTransport {
 #[path = "audio_tests.rs"]
 mod audio_tests;
 
+/// The stage durations of a timing frame, from the sender's stamps.
+///
+/// The sender carries each stamp as a non-negative delta from the capture
+/// time, so a stamp it never took is the capture time itself and falls before
+/// the stamps it did take. The stamps are negative until the engine has
+/// estimated the clock offset, still right relative to each other, so a sign
+/// says nothing. A stage missing either of its stamps comes out as `-1.0`,
+/// which the reporter drops, rather than a zero or a span across the gap.
+fn timing_frame(t: reactor_webrtc::TimingFrameInfo) -> TimingFrame {
+    let s = t.sender;
+    let stamps = [
+        s.capture_ms,
+        s.encode_start_ms,
+        s.encode_finish_ms,
+        s.packetization_finish_ms,
+        s.pacer_exit_ms,
+    ];
+    let mut taken = [true; 5];
+    let mut latest = stamps[0];
+    for (i, &stamp) in stamps.iter().enumerate().skip(1) {
+        if stamp < latest {
+            taken[i] = false;
+        } else {
+            latest = stamp;
+        }
+    }
+    let stage = |from: usize, to: usize| {
+        if taken[from] && taken[to] {
+            (stamps[to] - stamps[from]) as f64
+        } else {
+            -1.0
+        }
+    };
+    TimingFrame {
+        rtp_timestamp: t.rtp_timestamp,
+        encode_wait_ms: stage(0, 1),
+        packetize_ms: stage(2, 3),
+        pacer_ms: stage(3, 4),
+    }
+}
+
 #[cfg(test)]
 #[path = "dc_chunking_tests.rs"]
 mod dc_chunking_tests;
@@ -990,6 +1037,144 @@ mod dc_chunking_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sender(stamps: [i64; 5]) -> reactor_webrtc::TimingFrameInfo {
+        reactor_webrtc::TimingFrameInfo {
+            rtp_timestamp: 90_000,
+            is_outlier: false,
+            is_timer_triggered: false,
+            sender: reactor_webrtc::TimingFrameSenderTimestamps {
+                capture_ms: stamps[0],
+                encode_start_ms: stamps[1],
+                encode_finish_ms: stamps[2],
+                packetization_finish_ms: stamps[3],
+                pacer_exit_ms: stamps[4],
+            },
+            receiver: reactor_webrtc::TimingFrameReceiverTimestamps {
+                receive_start_ms: -1,
+                receive_finish_ms: -1,
+                decode_start_ms: -1,
+                decode_finish_ms: -1,
+            },
+        }
+    }
+
+    fn inbound(
+        timing_frame: Option<reactor_webrtc::TimingFrameInfo>,
+    ) -> reactor_webrtc::InboundRtpStats {
+        reactor_webrtc::InboundRtpStats {
+            ssrc: 1,
+            kind: RwStreamKind::Video,
+            mid: Some("0".into()),
+            codec_mime_type: Some("video/VP8".into()),
+            packets_received: 0,
+            bytes_received: 0,
+            jitter_s: 0.0,
+            packets_lost: 0,
+            nack_count: 0,
+            pli_count: 0,
+            fir_count: 0,
+            total_decode_time_s: 0.0,
+            frames_per_second: 0.0,
+            frames_decoded: 0,
+            frames_dropped: 0,
+            frame_width: 0,
+            frame_height: 0,
+            jitter_buffer_delay_s: 1.25,
+            jitter_buffer_target_delay_s: 0.0,
+            jitter_buffer_minimum_delay_s: 0.0,
+            jitter_buffer_emitted_count: 50,
+            total_processing_delay_s: 0.0,
+            timing_frame,
+        }
+    }
+
+    fn mapped_timing_frame(stamps: [i64; 5]) -> TimingFrame {
+        let report = StatsReport {
+            inbound_rtp: vec![inbound(Some(sender(stamps)))],
+            ..Default::default()
+        };
+        map_stats(report).inbound[0].timing_frame.unwrap()
+    }
+
+    #[test]
+    fn a_timing_frame_with_every_stamp_maps_to_its_stage_durations() {
+        let t = mapped_timing_frame([1_000, 1_004, 1_020, 1_023, 1_030]);
+        assert_eq!(t.rtp_timestamp, 90_000);
+        assert_eq!(t.encode_wait_ms, 4.0);
+        assert_eq!(t.packetize_ms, 3.0);
+        assert_eq!(t.pacer_ms, 7.0);
+    }
+
+    #[test]
+    fn a_missing_stamp_leaves_both_stages_it_bounds_negative() {
+        // The sender never stamped packetization: it reads as the capture
+        // time. packetize ends at it and pacer starts at it.
+        let t = mapped_timing_frame([1_000, 1_004, 1_020, 1_000, 1_030]);
+        assert_eq!(t.encode_wait_ms, 4.0);
+        assert!(t.packetize_ms < 0.0);
+        assert!(t.pacer_ms < 0.0);
+        // Nor the pacer exit: only pacer ends at it.
+        let t = mapped_timing_frame([1_000, 1_004, 1_020, 1_023, 1_000]);
+        assert_eq!(t.packetize_ms, 3.0);
+        assert!(t.pacer_ms < 0.0);
+    }
+
+    #[test]
+    fn stamps_before_the_clock_offset_is_known_are_still_times() {
+        // Negative until the engine estimates the offset, still right
+        // relative to each other.
+        let t = mapped_timing_frame([-30, -26, -10, -7, -1]);
+        assert_eq!(t.encode_wait_ms, 4.0);
+        assert_eq!(t.packetize_ms, 3.0);
+        assert_eq!(t.pacer_ms, 6.0);
+    }
+
+    #[test]
+    fn a_stream_without_a_timing_frame_maps_to_none() {
+        let report = StatsReport {
+            inbound_rtp: vec![inbound(None)],
+            ..Default::default()
+        };
+        assert_eq!(map_stats(report).inbound[0].timing_frame, None);
+    }
+
+    #[test]
+    fn the_frame_counters_carry_over() {
+        let report = StatsReport {
+            inbound_rtp: vec![inbound(None)],
+            outbound_rtp: vec![reactor_webrtc::OutboundRtpStats {
+                ssrc: 2,
+                kind: RwStreamKind::Video,
+                mid: Some("1".into()),
+                codec_mime_type: Some("video/VP8".into()),
+                packets_sent: 0,
+                bytes_sent: 0,
+                target_bitrate_bps: 0.0,
+                round_trip_time_s: 0.0,
+                total_round_trip_time_s: 0.0,
+                fraction_lost: 0.0,
+                packets_lost: 0,
+                retransmitted_packets_sent: 0,
+                nack_count: 0,
+                pli_count: 0,
+                fir_count: 0,
+                frames_per_second: 0.0,
+                frames_sent: 0,
+                frame_width: 0,
+                frame_height: 0,
+                frames_encoded: 120,
+                total_encode_time_s: 0.6,
+                total_packet_send_delay_s: 0.0,
+            }],
+            ..Default::default()
+        };
+        let stats = map_stats(report);
+        assert_eq!(stats.inbound[0].jitter_buffer_delay_s, 1.25);
+        assert_eq!(stats.inbound[0].jitter_buffer_emitted_count, 50);
+        assert_eq!(stats.outbound[0].frames_encoded, 120);
+        assert_eq!(stats.outbound[0].total_encode_time_s, 0.6);
+    }
 
     /// The microphone must not open because nobody said otherwise.
     ///
