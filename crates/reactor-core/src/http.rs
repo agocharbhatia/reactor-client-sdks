@@ -214,6 +214,11 @@ const RESERVED_HEADERS: &[&str] = &[
     "connection",
     "transfer-encoding",
     "upgrade",
+    "accept-encoding",
+    "te",
+    "trailer",
+    "expect",
+    "keep-alive",
 ];
 
 /// Check the caller's extra headers, sent on every request to the coordinator
@@ -406,6 +411,11 @@ mod tests {
             "connection",
             "Transfer-Encoding",
             "upgrade",
+            "Accept-Encoding",
+            "TE",
+            "trailer",
+            "Expect",
+            "keep-alive",
         ] {
             assert!(
                 validate_extra_headers(&pairs(&[(name, "x")])).is_err(),

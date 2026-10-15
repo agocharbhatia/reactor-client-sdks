@@ -48,6 +48,11 @@ _RESERVED_HEADERS = frozenset(
         "connection",
         "transfer-encoding",
         "upgrade",
+        "accept-encoding",
+        "te",
+        "trailer",
+        "expect",
+        "keep-alive",
     }
 )
 

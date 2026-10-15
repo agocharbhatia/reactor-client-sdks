@@ -428,6 +428,11 @@ class TestFetchJwt:
             "REACTOR-API-KEY",
             "Host",
             "Upgrade",
+            "Accept-Encoding",
+            "TE",
+            "trailer",
+            "Expect",
+            "keep-alive",
         ):
             with mock.patch("reactor_sdk._auth.urllib.request.urlopen") as urlopen:
                 with pytest.raises(AuthError, match="cannot be overridden"):

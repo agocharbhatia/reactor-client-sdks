@@ -281,10 +281,11 @@ void reactor_fetch_jwt(
  *   extra_headers_json — nullable.  JSON object of header name to string value,
  *                        sent on every request to the coordinator and the
  *                        signaling endpoints (not to presigned upload or clip
- *                        URLs), after the SDK's own headers.  Names the SDK sets
- *                        itself (Authorization, Content-Type, Content-Length,
+ *                        URLs), after the SDK's own headers.  Names the SDK or
+ *                        transport owns (Authorization, Content-Type, Content-Length,
  *                        Reactor-API-*, Reactor-WebRTC-Version, Host,
- *                        Connection, Transfer-Encoding, Upgrade), a name given
+ *                        Connection, Transfer-Encoding, Upgrade, Accept-Encoding,
+ *                        TE, Trailer, Expect, Keep-Alive), a name given
  *                        twice in any case, and values that are not visible
  *                        ASCII are refused by connect with an error.  Not
  *                        reserved: Reactor-Account-ID, which selects the
