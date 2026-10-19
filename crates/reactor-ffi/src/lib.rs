@@ -84,9 +84,31 @@ pub extern "system" fn JNI_OnLoad(
 
 static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
 
+// On Android stderr is discarded before it reaches logcat, so logs go through
+// the platform logger instead — read them with `adb logcat -s reactor:V`.
+// RUST_LOG is honored where the process environment allows it (e.g. via
+// `adb shell setprop log.tag.reactor VERBOSE` won't help here; the env var path
+// is mostly for tests), defaulting to info for all reactor-* crates.
+
+#[cfg(target_os = "android")]
+fn init_logger() {
+    let spec = std::env::var("RUST_LOG").unwrap_or_else(|_| "reactor=info".to_string());
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_tag("reactor")
+            .with_max_level(log::LevelFilter::Trace)
+            .with_filter(android_logger::FilterBuilder::new().parse(&spec).build()),
+    );
+}
+
+#[cfg(not(target_os = "android"))]
+fn init_logger() {
+    let _ = env_logger::builder().try_init();
+}
+
 pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
-        let _ = env_logger::builder().try_init();
+        init_logger();
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
