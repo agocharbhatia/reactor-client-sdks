@@ -26,6 +26,8 @@ export interface ReactorErrorOptions {
   operation?: string | undefined;
   retry_after_ms?: number | undefined;
   timestamp_ms?: number | undefined;
+  entry?: string | undefined;
+  command_code?: string | undefined;
   /** The underlying error, kept as the standard `Error.cause`. */
   cause?: unknown;
 }
@@ -48,6 +50,14 @@ export class ReactorError extends Error {
   readonly operation: string | undefined;
   /** Backoff hint the platform sent. */
   readonly retry_after_ms: number | undefined;
+  /** For a refused step or a step whose call failed, the part of the step
+   *  request at fault: `"state.<key>"`, `"commands[<i>]"` or
+   *  `"media_input[<i>]"`. */
+  readonly entry: string | undefined;
+  /** For a step whose call failed, the stable code its handler raised (its
+   *  `CommandError` code, or `internal_error`), to branch on instead of the
+   *  message. */
+  readonly command_code: string | undefined;
   /** When `reactor-core` reported this failure. For a purely local one (no
    *  payload at all — see {@link ReactorErrorOptions}), this is synthesized
    *  as the construction time instead, since there's nothing to report —
@@ -72,6 +82,8 @@ export class ReactorError extends Error {
     this.operation = options.operation;
     this.retry_after_ms = options.retry_after_ms;
     this.retryAfter = options.retry_after_ms;
+    this.entry = options.entry;
+    this.command_code = options.command_code;
     this.timestamp_ms = options.timestamp_ms ?? Date.now();
     this.timestamp = this.timestamp_ms;
   }
@@ -187,6 +199,60 @@ export class RecorderDisabledError extends ReactorError {
   static override readonly code = 'RECORDER_DISABLED';
 }
 
+/** The runtime did not start the session in the requested `generation` —
+ *  most often a runtime without stepped generation, which ignores the
+ *  request rather than refusing it. Not recoverable: the same `connect()`
+ *  against the same runtime fails the same way. */
+export class GenerationModeMismatchError extends ReactorError {
+  static override readonly code = 'GENERATION_MODE_MISMATCH';
+}
+
+/** `connect()` asked for stepped generation over a data channel that did not
+ *  negotiate chunking: this client or the runtime does not support it. A
+ *  step's inputs and result each ride one data-channel message, and without
+ *  chunking a single camera frame outgrows it. Not recoverable. */
+export class DataChannelChunkingRequiredError extends ReactorError {
+  static override readonly code = 'DATA_CHANNEL_CHUNKING_REQUIRED';
+}
+
+/** The runtime refused a `step()` — the request or the model turned it down.
+ *  The runtime checks the whole request before it applies any of it, so a
+ *  refused step changed nothing. The code is the runtime's own, passed
+ *  through, hence lowercase. */
+export class StepRefusedError extends ReactorError {
+  static override readonly code = 'step_refused';
+}
+
+/** A `step()` did not run because the session cannot take a step yet — it
+ *  is not in a running state that can. Nothing the step carried was applied.
+ *  Lowercase, as the runtime names the outcome. */
+export class StepNotReadyError extends ReactorError {
+  static override readonly code = 'step_not_ready';
+}
+
+/** A `step()` ran, but its result did not fit in one data-channel message. */
+export class StepResultTooLargeError extends ReactorError {
+  static override readonly code = 'step_result_too_large';
+}
+
+/** A `step()` did not run because the handler of one of its state keys or
+ *  commands failed. The calls before it stay applied and the ones after it
+ *  were skipped. Lowercase, as the runtime names the outcome. */
+export class StepCommandFailedError extends ReactorError {
+  static override readonly code = 'step_command_failed';
+}
+
+/** The session ended before a `step()`'s result could be sent, so whether the
+ *  step ran is unknown. Lowercase, as the runtime names the outcome. */
+export class StepSessionEndedError extends ReactorError {
+  static override readonly code = 'step_session_ended';
+}
+
+/** A `step()` result carried a frame in an encoding this SDK cannot decode. */
+export class UnsupportedFrameEncodingError extends ReactorError {
+  static override readonly code = 'UNSUPPORTED_FRAME_ENCODING';
+}
+
 /** Every code this package has a class for. Anything else — a platform code
  *  for a rejected request — falls back to `ReactorError` with `code` set to
  *  it. */
@@ -208,6 +274,14 @@ const ERROR_CLASSES = [
   RequestTimeoutError,
   AbortedError,
   RecorderDisabledError,
+  GenerationModeMismatchError,
+  DataChannelChunkingRequiredError,
+  StepRefusedError,
+  StepNotReadyError,
+  StepResultTooLargeError,
+  StepCommandFailedError,
+  StepSessionEndedError,
+  UnsupportedFrameEncodingError,
 ] as const;
 
 interface ReactorErrorClass {
@@ -234,6 +308,8 @@ interface ReactorErrorLike {
   operation?: string;
   retry_after_ms?: number;
   timestamp_ms?: number;
+  entry?: string;
+  command_code?: string;
 }
 
 /**
@@ -263,6 +339,8 @@ export function toReactorError(cause: unknown): ReactorError {
     operation: payload.operation,
     retry_after_ms: payload.retry_after_ms,
     timestamp_ms: payload.timestamp_ms,
+    entry: payload.entry,
+    command_code: payload.command_code,
     // A thrown JS error (a failed wasm load, say) keeps its stack and its own
     // `cause` reachable; reactor-core's plain payload objects have neither.
     cause: cause instanceof Error ? cause : undefined,

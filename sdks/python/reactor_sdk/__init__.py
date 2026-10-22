@@ -27,6 +27,7 @@ from ._auth import AuthError, fetch_jwt
 from ._media import time_micros
 from ._recording import download_clip
 from ._stats import CandidatePair, ConnectionStats, InboundStream, OutboundStream
+from ._step import StepCommand, StepFile, StepFrame, StepResult, StepTrackOutput
 from .client import (
     DEFAULT_API_URL,
     LOCAL_API_URL,
@@ -39,8 +40,10 @@ from .errors import (
     AbortedError,
     BadRequestError,
     ConflictError,
+    DataChannelChunkingRequiredError,
     DecodeError,
     DisconnectedError,
+    GenerationModeMismatchError,
     InvalidStateError,
     MessageTooLargeError,
     NetworkError,
@@ -51,8 +54,14 @@ from .errors import (
     RequestTimeoutError,
     ServerError,
     SessionTerminalError,
+    StepCommandFailedError,
+    StepNotReadyError,
+    StepRefusedError,
+    StepResultTooLargeError,
+    StepSessionEndedError,
     TransportError,
     UnauthorizedError,
+    UnsupportedFrameEncodingError,
     VersionMismatchError,
 )
 from .track import Track, TrackDirection, TrackKind, TrackList
@@ -71,6 +80,12 @@ __all__ = [
     "InboundStream",
     "OutboundStream",
     "CandidatePair",
+    # Stepped generation: what step() takes and answers with.
+    "StepCommand",
+    "StepResult",
+    "StepTrackOutput",
+    "StepFrame",
+    "StepFile",
     # Failures, and the `on_error` event payload — the same class. `ReactorError`
     # is the base of every one below it, so catching it still catches everything.
     "ReactorError",
@@ -91,6 +106,14 @@ __all__ = [
     "RequestTimeoutError",
     "AbortedError",
     "RecorderDisabledError",
+    "GenerationModeMismatchError",
+    "DataChannelChunkingRequiredError",
+    "UnsupportedFrameEncodingError",
+    "StepRefusedError",
+    "StepNotReadyError",
+    "StepResultTooLargeError",
+    "StepCommandFailedError",
+    "StepSessionEndedError",
     "AuthError",
     "fetch_jwt",
     "download_clip",

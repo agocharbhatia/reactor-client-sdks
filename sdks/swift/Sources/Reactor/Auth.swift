@@ -170,15 +170,22 @@ extension Reactor {
     /// initialiser when one token serves several clients, or when the token is
     /// minted somewhere else entirely — which is what a real app does, because an
     /// API key does not belong on a device.
+    ///
+    /// `generation` and `stepTimeout` are as for
+    /// ``init(model:jwt:apiURL:local:autoResumeTracks:generation:stepTimeout:extraHeaders:eventQueue:)``,
+    /// and are checked before the key is exchanged.
     public convenience init(
         model: String,
         apiKey: String,
         apiURL: String = Reactor.defaultAPIURL,
         options: TokenOptions? = nil,
         local: Bool = false,
+        generation: Generation = .streamed,
+        stepTimeout: Duration? = nil,
         extraHeaders: [String: String] = [:],
         eventQueue: DispatchQueue? = nil
     ) async throws {
+        _ = try Reactor.validateStepTimeout(stepTimeout, for: generation)
         // The same headers go on the exchange as on every later request.
         var tokenOptions = options
         if !extraHeaders.isEmpty {
@@ -189,8 +196,8 @@ extension Reactor {
         let token = try await Reactor.fetchJWT(
             apiKey: apiKey, apiURL: apiURL, options: tokenOptions, local: local)
         try self.init(
-            model: model, jwt: token, apiURL: apiURL, local: local,
-            extraHeaders: extraHeaders, eventQueue: eventQueue)
+            model: model, jwt: token, apiURL: apiURL, local: local, generation: generation,
+            stepTimeout: stepTimeout, extraHeaders: extraHeaders, eventQueue: eventQueue)
     }
 }
 

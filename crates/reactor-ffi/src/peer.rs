@@ -14,9 +14,9 @@ use log::{debug, info, warn};
 
 use reactor_core::error::CoreError;
 use reactor_core::peer::{
-    CandidatePairState, CandidatePairStats, IceCandidateType, InboundRtpStats, OutboundRtpStats,
-    PeerConnectionState as CorePeerConnectionState, PeerEvent, PeerTransport, PreparedOffer,
-    RelayProtocol, StreamKind, TimingFrame, TransportStats,
+    CandidatePairState, CandidatePairStats, ChunkingTotals, IceCandidateType, InboundRtpStats,
+    OutboundRtpStats, PeerConnectionState as CorePeerConnectionState, PeerEvent, PeerTransport,
+    PreparedOffer, RelayProtocol, StreamKind, TimingFrame, TransportStats,
 };
 use reactor_core::protocol::session::{TrackCapability, TrackDirection, TrackKind};
 use reactor_core::protocol::webrtc::{IceCandidate, IceServer, TrackMappingEntry};
@@ -175,6 +175,8 @@ fn map_pair_state(s: IceCandidatePairState) -> CandidatePairState {
 /// see [`timing_frame`].
 fn map_stats(report: StatsReport) -> TransportStats {
     TransportStats {
+        // Read off the channel, not the report: see `get_stats`.
+        data_chunking: None,
         inbound: report
             .inbound_rtp
             .into_iter()
@@ -199,6 +201,8 @@ fn map_stats(report: StatsReport) -> TransportStats {
                 jitter_buffer_delay_s: s.jitter_buffer_delay_s,
                 jitter_buffer_emitted_count: s.jitter_buffer_emitted_count,
                 timing_frame: s.timing_frame.map(timing_frame),
+                decoder_implementation: s.decoder_implementation,
+                power_efficient_decoder: s.power_efficient_decoder,
             })
             .collect(),
         outbound: report
@@ -226,6 +230,8 @@ fn map_stats(report: StatsReport) -> TransportStats {
                 frame_height: s.frame_height,
                 frames_encoded: s.frames_encoded,
                 total_encode_time_s: s.total_encode_time_s,
+                encoder_implementation: s.encoder_implementation,
+                power_efficient_encoder: s.power_efficient_encoder,
             })
             .collect(),
         candidate_pairs: report
@@ -248,6 +254,23 @@ fn map_stats(report: StatsReport) -> TransportStats {
                 local_relay_protocol: map_relay_protocol(p.local_relay_protocol),
             })
             .collect(),
+    }
+}
+
+/// A chunked channel's running totals, in the core's vocabulary.
+fn map_chunking(c: reactor_webrtc::ChunkingStats) -> ChunkingTotals {
+    ChunkingTotals {
+        messages_sent: c.messages_sent,
+        queue_wait_s: c.queue_wait_s,
+        send_s: c.send_s,
+        stall_s: c.stall_s,
+        messages_received: c.messages_received,
+        reassembly_s: c.reassembly_s,
+        enqueue_s: c.enqueue_s,
+        first_check_s: c.first_check_s,
+        first_build_s: c.first_build_s,
+        first_native_s: c.first_native_s,
+        native_send_s: c.native_send_s,
     }
 }
 
@@ -754,6 +777,11 @@ impl PeerTransport for ReactorWebRtcPeerTransport {
         }
     }
 
+    fn data_channel_chunked(&self) -> bool {
+        let s = self.state.lock().unwrap();
+        s.data_channel.as_ref().is_some_and(DataChannel::is_chunked)
+    }
+
     fn send_data(&self, payload: &[u8], binary: bool) -> Result<(), CoreError> {
         debug!("[peer] → data: {} byte(s), binary={binary}", payload.len());
         let s = self.state.lock().unwrap();
@@ -846,7 +874,16 @@ impl PeerTransport for ReactorWebRtcPeerTransport {
         // set_track_bitrate documents: the engine dispatches this onto a libwebrtc
         // thread and waits for the report, and that thread can be inside a frame
         // sink whose host handler wants this same mutex.
-        let pc = self.state.lock().unwrap().pc.clone();
+        // The chunked channel's totals are a plain read behind the channel's
+        // own lock, with no hop onto a libwebrtc thread, so they are taken here.
+        let (pc, chunking) = {
+            let s = self.state.lock().unwrap();
+            let chunking = s
+                .data_channel
+                .as_ref()
+                .and_then(DataChannel::chunking_stats);
+            (s.pc.clone(), chunking)
+        };
         let Some(pc) = pc else {
             return Err(CoreError::InvalidState(
                 "no peer connection to read statistics from".into(),
@@ -858,12 +895,20 @@ impl PeerTransport for ReactorWebRtcPeerTransport {
         // and unlike the bitrate setters — called once, by hand — this one is
         // built to be polled, so every sample would cost a worker for as long as
         // libwebrtc took to answer.
-        tokio::task::spawn_blocking(move || pc.get_stats().map(map_stats).map_err(peer_err))
-            .await
-            // A panic inside the blocking call, or a runtime shutting down under
-            // it. Neither leaves a report, and neither is this transport's own
-            // failure to describe any more precisely than by saying so.
-            .map_err(|e| CoreError::Peer(format!("statistics collection failed: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            pc.get_stats()
+                .map(|report| {
+                    let mut stats = map_stats(report);
+                    stats.data_chunking = chunking.map(map_chunking);
+                    stats
+                })
+                .map_err(peer_err)
+        })
+        .await
+        // A panic inside the blocking call, or a runtime shutting down under
+        // it. Neither leaves a report, and neither is this transport's own
+        // failure to describe any more precisely than by saying so.
+        .map_err(|e| CoreError::Peer(format!("statistics collection failed: {e}")))?
     }
 
     async fn close(&self) -> Result<(), CoreError> {
@@ -1067,6 +1112,8 @@ mod tests {
             kind: RwStreamKind::Video,
             mid: Some("0".into()),
             codec_mime_type: Some("video/VP8".into()),
+            decoder_implementation: None,
+            power_efficient_decoder: None,
             packets_received: 0,
             bytes_received: 0,
             jitter_s: 0.0,
@@ -1148,6 +1195,8 @@ mod tests {
                 kind: RwStreamKind::Video,
                 mid: Some("1".into()),
                 codec_mime_type: Some("video/VP8".into()),
+                encoder_implementation: None,
+                power_efficient_encoder: None,
                 packets_sent: 0,
                 bytes_sent: 0,
                 target_bitrate_bps: 0.0,

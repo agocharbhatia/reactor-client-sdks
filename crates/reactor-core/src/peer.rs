@@ -178,6 +178,11 @@ pub struct InboundRtpStats {
     /// The sender's stages for the slowest timing frame of the last second.
     /// Video only, and `None` before the first.
     pub timing_frame: Option<TimingFrame>,
+    /// The decoder that runs the stream, e.g. `"libvpx"`. `None` until the
+    /// first frame is decoded.
+    pub decoder_implementation: Option<String>,
+    /// Whether that decoder is the hardware one. `None` when not reported.
+    pub power_efficient_decoder: Option<bool>,
 }
 
 /// One send stream's counters, as the engine reports them.
@@ -232,6 +237,11 @@ pub struct OutboundRtpStats {
     pub frames_encoded: u32,
     /// Cumulative encode time, in seconds.
     pub total_encode_time_s: f64,
+    /// The encoder that runs the stream, e.g. `"libvpx"`. `None` until the
+    /// first frame is encoded.
+    pub encoder_implementation: Option<String>,
+    /// Whether that encoder is the hardware one. `None` when not reported.
+    pub power_efficient_encoder: Option<bool>,
 }
 
 /// State of an ICE candidate pair — mirror of `RTCIceCandidatePairStats::state`.
@@ -307,6 +317,41 @@ pub struct TransportStats {
     pub inbound: Vec<InboundRtpStats>,
     pub outbound: Vec<OutboundRtpStats>,
     pub candidate_pairs: Vec<CandidatePairStats>,
+    /// The running totals of the `"data"` channel's chunked messages. `None`
+    /// when the channel does not chunk, or the transport cannot tell.
+    pub data_chunking: Option<ChunkingTotals>,
+}
+
+/// Running totals of one chunked data channel's messages, since it opened.
+///
+/// Every time is in seconds and summed over the messages that finished the
+/// step, so a window's average is the change in a time over the change in its
+/// count.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ChunkingTotals {
+    /// Messages whose last frame was handed to the native channel.
+    pub messages_sent: u64,
+    /// From `send` to the message's first frame leaving the queue.
+    pub queue_wait_s: f64,
+    /// From a message's first frame to its last handed to the native channel.
+    pub send_s: f64,
+    /// The time the send pump stopped because the native buffer was full.
+    pub stall_s: f64,
+    /// Messages the reassembler completed.
+    pub messages_received: u64,
+    /// From a message's first frame arriving to its last.
+    pub reassembly_s: f64,
+    /// From `send` to the message in the queue: its copy into the queue.
+    pub enqueue_s: f64,
+    /// Within `queue_wait`: reading the native buffered amount before the
+    /// message's first frame.
+    pub first_check_s: f64,
+    /// Within `queue_wait`: cutting the message's first frame off the queue.
+    pub first_build_s: f64,
+    /// Within `queue_wait`: the native `Send` of the message's first frame.
+    pub first_native_s: f64,
+    /// The native `Send` of every frame.
+    pub native_send_s: f64,
 }
 
 /// Result of [`PeerTransport::prepare`]: a local SDP offer plus the
@@ -423,6 +468,13 @@ pub trait PeerTransport {
     /// Negotiated maximum data-channel message size.
     fn max_message_bytes(&self) -> usize {
         crate::protocol::DEFAULT_MAX_MESSAGE_BYTES
+    }
+
+    /// Whether the data channel carries chunked messages, as both sides
+    /// negotiated and the channel decided when it opened. A transport without
+    /// chunking says no, and a stepped session refuses to connect over it.
+    fn data_channel_chunked(&self) -> bool {
+        false
     }
 
     /// Push a raw BGRA video frame into the named sendonly track.

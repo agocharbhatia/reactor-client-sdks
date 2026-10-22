@@ -27,6 +27,7 @@ mod device;
 pub mod error;
 pub mod events;
 pub mod http;
+pub mod message_stages;
 pub mod messaging;
 pub mod peer;
 pub mod reactor;
@@ -36,6 +37,7 @@ pub mod signaling;
 pub mod stage_times;
 pub mod state;
 pub mod stats;
+pub mod step;
 
 /// Re-export of the wire-protocol crate.
 pub use reactor_protocol as protocol;

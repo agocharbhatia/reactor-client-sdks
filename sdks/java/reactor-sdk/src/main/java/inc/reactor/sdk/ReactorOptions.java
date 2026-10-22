@@ -24,6 +24,8 @@ public final class ReactorOptions {
     private final boolean autoResumeTracks;
     private final Map<String, String> extraHeaders;
     private final @Nullable Dispatcher dispatcher;
+    private final Generation generation;
+    private final @Nullable Double stepTimeoutSeconds;
 
     private ReactorOptions(Builder builder) {
         this.apiUrl = builder.apiUrl;
@@ -34,6 +36,8 @@ public final class ReactorOptions {
         this.autoResumeTracks = builder.autoResumeTracks;
         this.extraHeaders = Map.copyOf(builder.extraHeaders);
         this.dispatcher = builder.dispatcher;
+        this.generation = builder.generation;
+        this.stepTimeoutSeconds = builder.stepTimeoutSeconds;
     }
 
     /**
@@ -86,6 +90,19 @@ public final class ReactorOptions {
         return dispatcher;
     }
 
+    /** @return how the session generates: {@link Generation#STREAMED} unless asked otherwise */
+    public Generation generation() {
+        return generation;
+    }
+
+    /**
+     * @return how many seconds a {@link Reactor#step step} may take, generation included, or
+     *     {@code null} for the native library's default of 300
+     */
+    public @Nullable Double stepTimeoutSeconds() {
+        return stepTimeoutSeconds;
+    }
+
     /** Builds {@link ReactorOptions}. */
     public static final class Builder {
 
@@ -97,6 +114,8 @@ public final class ReactorOptions {
         private boolean autoResumeTracks = true;
         private Map<String, String> extraHeaders = Map.of();
         private @Nullable Dispatcher dispatcher;
+        private Generation generation = Generation.STREAMED;
+        private @Nullable Double stepTimeoutSeconds;
 
         private Builder(String apiUrl, String modelName) {
             this.apiUrl = Objects.requireNonNull(apiUrl, "apiUrl");
@@ -172,8 +191,53 @@ public final class ReactorOptions {
             return this;
         }
 
-        /** @return the options */
+        /**
+         * How the session generates.
+         *
+         * <p>{@link Generation#STEPPED} asks for a session that generates one {@link Reactor#step
+         * step} at a time instead of streaming. {@link Reactor#connect()} then fails with {@link
+         * GenerationModeMismatchException} when the runtime does not start the session that way, as
+         * one without stepped generation will not.
+         *
+         * @param generation the mode; defaults to {@link Generation#STREAMED}
+         * @return this builder
+         */
+        public Builder generation(Generation generation) {
+            this.generation = Objects.requireNonNull(generation, "generation");
+            return this;
+        }
+
+        /**
+         * How long a {@link Reactor#step step} may take, generation included, before it fails with
+         * {@link RequestTimeoutException}. Stepped sessions only.
+         *
+         * @param seconds a finite, positive number of seconds; the native library's default is 300
+         * @return this builder
+         */
+        public Builder stepTimeoutSeconds(double seconds) {
+            this.stepTimeoutSeconds = seconds;
+            return this;
+        }
+
+        /**
+         * @return the options
+         * @throws IllegalArgumentException when a step timeout was set for a streamed session, or is
+         *     not a finite, positive number — the first would be ignored in silence, and the second
+         *     cannot become a duration
+         */
         public ReactorOptions build() {
+            if (stepTimeoutSeconds != null) {
+                if (generation != Generation.STEPPED) {
+                    throw new IllegalArgumentException(
+                            "stepTimeoutSeconds only applies to a stepped session: set generation(Generation.STEPPED)"
+                                    + " or drop the timeout");
+                }
+                if (!Double.isFinite(stepTimeoutSeconds) || stepTimeoutSeconds <= 0) {
+                    throw new IllegalArgumentException(
+                            "stepTimeoutSeconds must be a finite, positive number of seconds; got "
+                                    + stepTimeoutSeconds);
+                }
+            }
             return new ReactorOptions(this);
         }
     }

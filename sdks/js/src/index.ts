@@ -18,6 +18,14 @@ export {
   RequestTimeoutError,
   AbortedError,
   RecorderDisabledError,
+  GenerationModeMismatchError,
+  DataChannelChunkingRequiredError,
+  StepRefusedError,
+  StepNotReadyError,
+  StepResultTooLargeError,
+  StepCommandFailedError,
+  StepSessionEndedError,
+  UnsupportedFrameEncodingError,
 } from './errors';
 export {
   DEFAULT_PLAYLIST_POLL_SLACK_MS,
@@ -29,6 +37,7 @@ export {
 } from './recording';
 export type { DownloadClipOptions, FetchPlaylistOptions } from './recording';
 export { FileRef, isFileRef } from './file-ref';
+export { stepFrameToImageData } from './step-frames';
 export { normalizeJwtSource } from './jwt';
 export type { JwtResolver } from './jwt';
 export type {
@@ -39,6 +48,7 @@ export type {
   ConnectionStats,
   ConnectionTimings,
   ConnectOptions,
+  GenerationMode,
   JwtRequestContext,
   JwtSource,
   MessageScope,
@@ -47,12 +57,23 @@ export type {
   ModelSchemaPathItem,
   ModerationAction,
   ModerationEvent,
+  PublishedTrack,
+  PushAudioFrame,
+  PushFrame,
+  PushFrameOptions,
+  PushVideoFrame,
   ReactorEventMap,
   ReactorEventName,
   ReactorMessage,
   ReactorOptions,
   ReactorStatus,
   SessionResponse,
+  StepCommand,
+  StepFile,
+  StepFrame,
+  StepOptions,
+  StepResult,
+  StepTrack,
   TrackCapability,
   TrackDirection,
   TrackKind,
