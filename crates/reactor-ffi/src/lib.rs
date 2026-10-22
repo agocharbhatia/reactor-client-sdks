@@ -55,6 +55,7 @@ use reactor_core::auth::{fetch_jwt, TokenRequest};
 use reactor_core::error::CoreError;
 use reactor_core::events::ReactorEvent;
 use reactor_core::http::{check_status, StaticAuth};
+use reactor_core::message_stages::{self, CommandEntry};
 use reactor_core::peer::PeerEvent;
 use reactor_core::protocol::session::GenerationMode;
 use reactor_core::protocol::upload::FileRef;
@@ -350,6 +351,29 @@ fn spawn_tracked(tasks: &TaskSet, future: impl std::future::Future<Output = ()> 
     tasks.push(handle);
 }
 
+/// Run *body* as one of *handle*'s tasks and resolve *completion* with its
+/// result. A hook *body* returns runs just before the host is called back.
+fn spawn_completion(
+    handle: &ReactorHandle,
+    mut completion: Completion,
+    body: impl std::future::Future<
+            Output = (
+                Result<Option<serde_json::Value>, CoreError>,
+                Option<CallbackHook>,
+            ),
+        > + Send
+        + 'static,
+) {
+    let control_tx: HostSender<HostJob> = handle.hosts.control.sender();
+    spawn_tracked(&handle.tasks, async move {
+        let (result, hook) = body.await;
+        completion.before_callback = hook;
+        // Resolved on the control thread, not here: a completion callback that
+        // blocks would otherwise park a tokio worker.
+        control_tx.send(Box::new(move || completion.resolve(result)));
+    });
+}
+
 struct Completion {
     f: Option<unsafe extern "C" fn(c_int, *const c_char, *const c_char, *mut c_void)>,
     userdata: *mut c_void,
@@ -357,7 +381,13 @@ struct Completion {
     /// The entry point this completion belongs to, reported as `operation` so a
     /// host can say which call failed without tracking it itself.
     operation: &'static str,
+    /// Run just before the result calls the host back, to time the way back
+    /// to the host.
+    before_callback: Option<CallbackHook>,
 }
+
+/// Work a [`Completion`] runs just before it calls the host back.
+type CallbackHook = Box<dyn FnOnce() + Send>;
 unsafe impl Send for Completion {}
 unsafe impl Sync for Completion {}
 
@@ -373,6 +403,7 @@ impl Completion {
             userdata,
             gate,
             operation,
+            before_callback: None,
         }
     }
 
@@ -388,6 +419,9 @@ impl Completion {
             Ok(v) => {
                 let json = v.map(|j| j.to_string()).unwrap_or_else(|| "{}".to_string());
                 if let Ok(cs) = CString::new(json) {
+                    if let Some(hook) = self.before_callback {
+                        hook();
+                    }
                     unsafe { func(1, cs.as_ptr(), std::ptr::null(), self.userdata) }
                 }
             }
@@ -398,6 +432,9 @@ impl Completion {
                 // the code and whether retrying is worth anything were both in
                 // the `CoreError` and both thrown away here.
                 if let Some(cs) = error_json(&e, self.operation) {
+                    if let Some(hook) = self.before_callback {
+                        hook();
+                    }
                     unsafe { func(0, std::ptr::null(), cs.as_ptr(), self.userdata) }
                 }
             }
@@ -1324,16 +1361,12 @@ macro_rules! async_op {
         }
         let handle = unsafe { &*$handle };
         let reactor = handle.reactor.clone();
-        let tasks = handle.tasks.clone();
         let body_tasks = handle.tasks.clone();
         let completion = Completion::new($completion, $userdata, handle.gate.clone(), $name);
-        let control_tx: HostSender<HostJob> = handle.hosts.control.sender();
-        spawn_tracked(&tasks, async move {
+        spawn_completion(handle, completion, async move {
             let result: Result<Option<serde_json::Value>, CoreError> =
                 $body(reactor, body_tasks).await;
-            // Resolved on the control thread, not here: a completion callback that
-            // blocks would otherwise park a tokio worker.
-            control_tx.send(Box::new(move || completion.resolve(result)));
+            (result, None)
         });
     }};
 }
@@ -1744,6 +1777,8 @@ pub unsafe extern "C" fn reactor_send_command(
     if handle.is_null() {
         return;
     }
+    // The command's `ffi_parse` stage starts here, on the core's clock.
+    let entered_ms = (*handle).reactor.monotonic_ms();
     let name = CStr::from_ptr(name).to_string_lossy().into_owned();
     let args: serde_json::Value = if args_json.is_null() {
         serde_json::json!({})
@@ -1777,15 +1812,35 @@ pub unsafe extern "C" fn reactor_send_command(
             }
         }
     };
-    async_op!(
-        "send_command",
-        handle,
-        completion,
-        userdata,
-        move |r: Arc<Reactor>, _tasks: TaskSet| async move {
-            r.send_command(&name, args, uploads).await
-        }
-    );
+    let handle = &*handle;
+    let reactor = handle.reactor.clone();
+    let entry = CommandEntry {
+        entered_ms,
+        parsed_ms: reactor.monotonic_ms(),
+    };
+    // The command's way back to the host is timed as `ffi_return`: from the
+    // core returning the reply to the host called back.
+    let generation = reactor.message_generation();
+    let completion = Completion::new(completion, userdata, handle.gate.clone(), "send_command");
+    spawn_completion(handle, completion, async move {
+        let result = reactor
+            .send_command_from(&name, args, uploads, Some(entry))
+            .await;
+        let returned_ms = reactor.monotonic_ms();
+        // Timed for a command the model answered, with a reply or an error, as
+        // the core's other stages are; not for one that never got an answer.
+        let answered = matches!(result, Ok(_) | Err(CoreError::CommandRequest { .. }));
+        let hook = answered.then(|| -> CallbackHook {
+            Box::new(move || {
+                reactor.add_message_stage(
+                    generation,
+                    message_stages::FFI_RETURN,
+                    reactor.monotonic_ms() - returned_ms,
+                );
+            })
+        });
+        (result, hook)
+    });
 }
 
 /// Upload a local file and return a reference to pass as a command argument.
