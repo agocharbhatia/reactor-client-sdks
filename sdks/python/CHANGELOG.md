@@ -9,16 +9,26 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [1.13.0] - 2026-10-22
+## [1.13.0] - 2026-10-23
 
 ### Added
 
 - `Reactor(..., extra_headers={...})` sends extra HTTP headers on every request the
-  client makes to the coordinator and signaling. Reserved names such as
-  `Authorization` are rejected at `connect()`.
+  client makes to the coordinator and signaling, including those of a stepped
+  client. Reserved names such as `Authorization` are rejected at `connect()`.
 - `fetch_jwt(..., extra_headers={...})` sends extra HTTP headers on the token
   request, after the SDK's own. Reserved names such as `Authorization` raise
   `AuthError` before any request is made.
+
+## [1.12.1] - 2026-10-23
+
+### Changed
+
+- The WebRTC engine moves from reactor-webrtc 0.24.1 to 0.24.2, on libwebrtc
+  `webrtc-7907-a5ddff60-p13`. It does less work per SCTP packet, and a chunked
+  data-channel frame reaches libwebrtc in one trip to the network thread
+  instead of three, so commands leave sooner.
+- The musl wheels build on the matching native release, `p13`.
 
 ## [1.12.0] - 2026-10-22
 

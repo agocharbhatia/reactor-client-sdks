@@ -7,15 +7,20 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [1.6.0] - 2026-10-22
+## [1.7.0] - 2026-10-23
 
 ### Added
 
 - `Reactor(..., extraHeaders: [...])` sends extra HTTP headers on every
-  coordinator and signaling request the client makes. Reserved header names are
-  rejected when the client connects.
+  coordinator and signaling request the client makes, including those of a
+  stepped client. Reserved header names are rejected when the client connects.
 - `Reactor.TokenOptions(extraHeaders: [...])` sends extra HTTP headers on the
   token request. Reserved header names fail the call.
+
+## [1.6.0] - 2026-10-23
+
+### Added
+
 - Stepped generation. `Reactor(..., generation: .stepped)` asks for a session
   that generates one step at a time, and `try await reactor.step(state: ...,
   commands: [...])` runs one and returns a `StepResult`: per output track, its
@@ -40,6 +45,20 @@ versioning follows [Semantic Versioning](https://semver.org/).
   run), `stepSessionEnded` (the session ended first; whether the step ran is
   unknown), `stepResultTooLarge`, `messageTooLarge` or
   `unsupportedFrameEncoding`. New example: `09_stepped_generation`.
+- Client stats now report where each command spends its time, stage by
+  stage, on the way out (the SDK's own stages, then the data channel's
+  `enqueue`, `queue_wait`, `send` and `stall`) and on the way back
+  (`reassembly`, then the SDK's), each reading carrying the stages' time and
+  command count since the previous one. They also name the encoder and decoder
+  each video track runs, and whether it is the hardware one. Nothing changes in
+  the public API.
+
+### Changed
+
+- The WebRTC engine moves from reactor-webrtc 0.22.1 to 0.24.2, on libwebrtc
+  `webrtc-7907-a5ddff60-p13`. It does less work per SCTP packet, and a chunked
+  data-channel frame reaches libwebrtc in one trip to the network thread
+  instead of three, so commands leave sooner.
 
 ### Fixed
 

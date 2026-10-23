@@ -620,6 +620,22 @@ checksum = "sha256:ec381e40cf1caf8496265bbf14ca0d2cb947495cd3e9069947e2fa75f7de7
 url = "https://conda.anaconda.org/conda-forge/osx-64/zstd-1.5.7-hbc1a06c_7.conda"
 checksum = "sha256:5277886d9704a624dc9b79ac985861e1e431bdb39a57c082507ab577a138ec6c"
 
+[[tools.android-sdk]]
+version = "23.0"
+backend = "vfox:mise-plugins/vfox-android-sdk"
+
+[tools.android-sdk."platforms.linux-arm64"]
+url = "https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip"
+
+[tools.android-sdk."platforms.linux-x64"]
+url = "https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip"
+
+[tools.android-sdk."platforms.macos-arm64"]
+url = "https://dl.google.com/android/repository/commandlinetools-mac_arm64-16111833_latest.zip"
+
+[tools.android-sdk."platforms.macos-x64"]
+url = "https://dl.google.com/android/repository/commandlinetools-mac_x86_64-16111833_latest.zip"
+
 [[tools."aqua:cargo-bins/cargo-binstall"]]
 version = "1.21.0"
 backend = "aqua:cargo-bins/cargo-binstall"
@@ -691,6 +707,10 @@ url = "https://static.rust-lang.org/rustup/archive/1.28.2/aarch64-apple-darwin/r
 [tools."aqua:rust-lang/rustup"."platforms.macos-x64"]
 checksum = "sha256:9c331076f62b4d0edeae63d9d1c9442d5fe39b37b05025ec8d41c5ed35486496"
 url = "https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-apple-darwin/rustup-init"
+
+[[tools."cargo:cargo-ndk"]]
+version = "4.1.2"
+backend = "cargo:cargo-ndk"
 
 [[tools."cargo:cargo-nextest"]]
 version = "0.9.140"
@@ -1175,7 +1195,7 @@ backend = "core:rust"
 
 [tools.rust.options]
 components = "clippy,rustfmt"
-targets = "aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim,wasm32-unknown-unknown,x86_64-apple-darwin,x86_64-unknown-linux-gnu"
+targets = "aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-linux-android,wasm32-unknown-unknown,x86_64-apple-darwin,x86_64-unknown-linux-gnu"
 
 [[tools.shellcheck]]
 version = "0.11.0"

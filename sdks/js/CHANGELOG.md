@@ -9,7 +9,7 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [3.3.0] - 2026-10-22
+## [3.4.0] - 2026-10-23
 
 ### Added
 
@@ -19,6 +19,11 @@ versioning follows [Semantic Versioning](https://semver.org/).
   or values are rejected when the client is constructed. In a browser, a
   custom header triggers a CORS preflight, so the API's allowed headers must
   list each name used.
+
+## [3.3.0]
+
+### Added
+
 - Stepped generation. `new Reactor({ generation: "stepped" })` asks the runtime
   to start a session that generates one step at a time, and `connect()` fails
   with the new `GenerationModeMismatchError` when it does not. `step({ state,
@@ -53,6 +58,11 @@ versioning follows [Semantic Versioning](https://semver.org/).
   passed there, with a console warning, and sends no RTP. A streamed session
   still requires it and rejects `publishTrack(name)` without one with an
   `InvalidStateError`.
+
+### Changed
+
+- The data-channel framing moves to reactor-webrtc-dc-chunking 0.24.2, in step
+  with the native SDKs' engine.
 
 ## [3.2.0]
 
