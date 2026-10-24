@@ -9,7 +9,7 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [1.13.0] - 2026-10-23
+## [1.14.0] - 2026-10-23
 
 ### Added
 
@@ -19,6 +19,20 @@ versioning follows [Semantic Versioning](https://semver.org/).
 - `fetch_jwt(..., extra_headers={...})` sends extra HTTP headers on the token
   request, after the SDK's own. Reserved names such as `Authorization` raise
   `AuthError` before any request is made.
+
+## [1.13.0] - 2026-10-23
+
+### Added
+
+- Encoded video in a step. `Reactor.step(media={"webcam": [EncodedFrame(...)]})`
+  and `Track.push_encoded_frame(data, width=..., height=...)` send H.264 access
+  units as they are, and the runtime decodes them before the step runs, so the
+  model reads RGB frames as for a raw push. A track's frames of one step go in
+  decode order, starting at a keyframe; a step whose frames do not decode raises
+  `StepRefusedError`. `media` takes raw RGB arrays too, and is checked whole
+  before any of it is pushed: a bad track or frame anywhere in it raises and
+  leaves the step buffer as it was. Needs a `libreactor_ffi` with
+  `reactor_push_step_encoded_video_frame`.
 
 ## [1.12.1] - 2026-10-23
 
