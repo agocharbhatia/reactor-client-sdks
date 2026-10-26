@@ -11,6 +11,11 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A step's `media` no longer pushes part of itself before refusing a later
+  encoded frame: a `width`, `height` or `capture_time_us` out of the C ABI's
+  range, which ctypes would have wrapped, is now refused with the rest of the
+  frame's checks, before any frame is pushed.
+
 - Same-session `reconnect()` could time out after 30 s ("transport readiness
   did not complete") on high-latency links. Each ICE candidate was POSTed to
   the coordinator inline in the peer-event pump, so a reconnect's candidate
