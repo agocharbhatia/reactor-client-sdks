@@ -98,13 +98,13 @@ works by luck of ownership and answers 403 for anybody else's model.
 
 ## Frames stay on the FFI thread
 
-Control events — status, errors, session id, messages — are delivered on the
-dispatcher the `Reactor` was built with, `Dispatchers.Main.immediate` by default,
-because an Android handler usually touches UI.
+Control events — status, errors, session id — are delivered on the dispatcher the
+`Reactor` was built with, `Dispatchers.Main.immediate` by default, because an
+Android handler usually touches UI.
 
-Messages the model sends arrive on `messages`, each a `{"type", "data"}` object —
-including the ones no call returns, such as state updates. Collect before
-`connect()` to see every one:
+Messages the model sends arrive on `messages`, in order, each a `{"type", "data"}`
+object — including the ones no call returns, such as state updates. They run on
+the collector's own context. Collect before `connect()` to see every one:
 
 ```kotlin
 lifecycleScope.launch {

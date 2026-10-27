@@ -84,17 +84,19 @@ public class Reactor(
         MutableSharedFlow<Map<String, Any?>>(
             replay = 0,
             extraBufferCapacity = 64,
-            // As for errors: a collector that falls behind loses the oldest messages rather than
-            // stalling the FFI's event thread, which also delivers everything else.
+            // A collector that falls behind loses the oldest messages rather than stalling the
+            // FFI's event thread, which also delivers everything else.
             onBufferOverflow = BufferOverflow.DROP_OLDEST,
         )
 
     /**
-     * Messages the model sends, as they arrive — each a JSON object, usually `{"type", "data"}`.
+     * Messages the model sends, in the order it sent them — each a JSON object, `{"type", "data"}`.
      *
      * Includes the messages the model sends on its own, such as state updates, which no call
      * returns. A command's reply is also the return value of [sendCommand]. Only what arrives
      * while something collects is delivered: start collecting before [connect] to see every one.
+     * Collectors run on their own context, such as `lifecycleScope`; one that falls more than 64
+     * messages behind loses the oldest.
      */
     public val messages: SharedFlow<Map<String, Any?>> = _messages.asSharedFlow()
 
@@ -150,8 +152,10 @@ public class Reactor(
      * object alive for the life of the handle, and a strong reference here would make the client
      * — and therefore the session — unreachable for garbage collection until teardown, which is
      * the opposite of what an Android app needs when an Activity goes away.
+     *
+     * Internal rather than private only so the message routing is testable without a device.
      */
-    private class Events(
+    internal class Events(
         owner: Reactor,
     ) : NativeEvents {
         private val owner = WeakReference(owner)
@@ -478,8 +482,12 @@ public class Reactor(
     }
 
     /**
-     * Parsed here, on the FFI's thread, and handed to the dispatcher only once it is a value. A
-     * message that is not a JSON object is dropped: the FFI promises an object, and reshaping
+     * Parsed and emitted here, on the FFI's thread, not launched onto the dispatcher. The FFI
+     * delivers messages on one thread and in order; a launch per message could reorder them on a
+     * multi-threaded dispatcher, and would queue coroutines without bound ahead of the buffer.
+     * `tryEmit` on a drop-oldest flow never fails or suspends, so ordering and the bound both hold.
+     *
+     * A message that is not a JSON object is dropped: the FFI promises an object, and reshaping
      * something else into one would hand a collector a message the model never sent.
      */
     private fun deliverMessage(
@@ -496,7 +504,7 @@ public class Reactor(
                 }
             } ?: return
         val flow = if (runtime) _runtimeMessages else _messages
-        scope.launch { flow.emit(message) }
+        flow.tryEmit(message)
     }
 
     private fun deliverSessionId(id: String?) {
