@@ -35,9 +35,6 @@ versioning follows [Semantic Versioning](https://semver.org/).
   another thread could destroy the handle in between. Pushes now go in under
   the barrier `close()` waits on, a step's media together with the step that
   takes it.
-
-### Fixed
-
 - Same-session `reconnect()` could time out after 30 s ("transport readiness
   did not complete") on high-latency links. Each ICE candidate was POSTed to
   the coordinator inline in the peer-event pump, so a reconnect's candidate
