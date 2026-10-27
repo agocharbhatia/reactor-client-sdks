@@ -1,21 +1,17 @@
 # Reactor Android SDK
 
+[![Maven Central: reactor-sdk-android](https://img.shields.io/maven-central/v/inc.reactor/reactor-sdk-android.svg?label=reactor-sdk-android)](https://central.sonatype.com/artifact/inc.reactor/reactor-sdk-android)
+[![Maven Central: reactor-sdk-android-media](https://img.shields.io/maven-central/v/inc.reactor/reactor-sdk-android-media.svg?label=reactor-sdk-android-media)](https://central.sonatype.com/artifact/inc.reactor/reactor-sdk-android-media)
+[![build](https://img.shields.io/github/actions/workflow/status/reactor-team/reactor-client-sdks/ci.yml?branch=main)](https://github.com/reactor-team/reactor-client-sdks/actions)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/reactor-team/reactor-client-sdks/blob/main/LICENSE)
+
 A Reactor client for Android, bound to `libreactor_ffi` through a C++ JNI bridge.
 
 Same object model as every other Reactor SDK — a `Reactor`, the `Track`s a model
 declares, one flat list of typed errors — spelled in Kotlin, with `StateFlow` for
 state and `suspend` for anything that waits.
 
-## Why this is separate from the Java SDK
-
-`inc.reactor:reactor-sdk` is bound through the Foreign Function & Memory API,
-which does not exist on Android. It also exposes `java.lang.foreign.MemorySegment`
-in its *public* API — `VideoFrame`, `AudioFrame` and `Media` — so an Android
-consumer cannot name those types and there is no shared module to extract. This
-SDK is an independent binding over the same native core, reached through JNI, with
-the same object model spelled in Kotlin.
-
-The Java SDK remains the answer for desktop JVM and desktop Kotlin.
+For desktop JVM or desktop Kotlin, use the [Java SDK](../java/README.md) instead.
 
 ## Requirements
 
@@ -394,3 +390,12 @@ Rebuild the native library — `mise run build:android:native`. The AAR carries 
 compiled `libreactor_ffi.so`, and a stale one links, resolves and then corrupts the
 stack at a call that gained a parameter; it does not fail at load. The load-time
 ABI check catches the version skew, but only once the library is actually rebuilt.
+
+## Documentation
+
+The [full documentation](https://docs.reactor.inc/sdk-reference/using-the-sdk)
+covers platform concepts and the other language SDKs.
+
+## License
+
+Apache-2.0 — see [`LICENSE`](../../LICENSE).
