@@ -80,6 +80,37 @@ public class Reactor(
      */
     public val errors: SharedFlow<ReactorException> = _errors.asSharedFlow()
 
+    private val _messages =
+        MutableSharedFlow<Map<String, Any?>>(
+            replay = 0,
+            extraBufferCapacity = 64,
+            // As for errors: a collector that falls behind loses the oldest messages rather than
+            // stalling the FFI's event thread, which also delivers everything else.
+            onBufferOverflow = BufferOverflow.DROP_OLDEST,
+        )
+
+    /**
+     * Messages the model sends, as they arrive — each a JSON object, usually `{"type", "data"}`.
+     *
+     * Includes the messages the model sends on its own, such as state updates, which no call
+     * returns. A command's reply is also the return value of [sendCommand]. Only what arrives
+     * while something collects is delivered: start collecting before [connect] to see every one.
+     */
+    public val messages: SharedFlow<Map<String, Any?>> = _messages.asSharedFlow()
+
+    private val _runtimeMessages =
+        MutableSharedFlow<Map<String, Any?>>(
+            replay = 0,
+            extraBufferCapacity = 16,
+            onBufferOverflow = BufferOverflow.DROP_OLDEST,
+        )
+
+    /**
+     * Messages the platform sends about the session, as JSON objects — recording lifecycle and
+     * moderation notices, for example. Distinct from [messages], which come from the model.
+     */
+    public val runtimeMessages: SharedFlow<Map<String, Any?>> = _runtimeMessages.asSharedFlow()
+
     private val _sessionId = MutableStateFlow<String?>(null)
 
     /** The session's id once there is one, null when it is cleared. */
@@ -135,6 +166,14 @@ public class Reactor(
 
         override fun onSessionId(sessionId: String?) {
             owner.get()?.deliverSessionId(sessionId)
+        }
+
+        override fun onMessage(messageJson: String?) {
+            owner.get()?.deliverMessage(messageJson, runtime = false)
+        }
+
+        override fun onRuntimeMessage(messageJson: String?) {
+            owner.get()?.deliverMessage(messageJson, runtime = true)
         }
 
         // Frames are *not* handed to the dispatcher. They run here, on the FFI's thread, because
@@ -436,6 +475,28 @@ public class Reactor(
 
     private fun deliverError(error: ReactorException) {
         scope.launch { _errors.emit(error) }
+    }
+
+    /**
+     * Parsed here, on the FFI's thread, and handed to the dispatcher only once it is a value. A
+     * message that is not a JSON object is dropped: the FFI promises an object, and reshaping
+     * something else into one would hand a collector a message the model never sent.
+     */
+    private fun deliverMessage(
+        json: String?,
+        runtime: Boolean,
+    ) {
+        val message =
+            json?.let {
+                try {
+                    inc.reactor.sdk.android.internal.Json
+                        .parseObject(it)
+                } catch (_: inc.reactor.sdk.android.internal.JsonException) {
+                    null
+                }
+            } ?: return
+        val flow = if (runtime) _runtimeMessages else _messages
+        scope.launch { flow.emit(message) }
     }
 
     private fun deliverSessionId(id: String?) {
